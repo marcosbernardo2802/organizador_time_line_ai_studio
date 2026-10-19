@@ -1,0 +1,6 @@
+{
+  "name": "Crônicas Estelares — Editor",
+  "description": "Editor de vídeo e sincronizador de timeline espacial para Crônicas Estelares.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

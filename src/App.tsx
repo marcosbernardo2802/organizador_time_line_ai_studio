@@ -1730,6 +1730,8 @@ export default function App() {
         isOpen={modal === 'export'}
         onClose={() => setModal(null)}
         renderState={renderState}
+        motorOnline={motorOnline}
+        onOpenMotorModal={() => setModal('motor')}
         onExportJson={() => {
           const data = { clips, library: library.map((m) => ({ ...m, url: undefined })), duration };
           const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -1739,7 +1741,9 @@ export default function App() {
           a.click();
         }}
         onRenderColab={async () => {
-          const videoClips = clips.filter((c) => c.trackId === 'video-1');
+          const videoClips = clips
+            .filter((c) => c.trackId === 'video-1')
+            .sort((a, b) => a.startTime - b.startTime);
           const narClip = clips.find((c) => c.trackId === 'audio-1');
           const bgmClip = clips.find((c) => c.trackId === 'audio-2');
           if (videoClips.length === 0) {
@@ -1754,13 +1758,13 @@ export default function App() {
           }
 
           if (motorOnline) {
-            setRenderState({ isRendering: true, progress: 5, status: 'Preparando arquivos para a GPU do Colab...' });
-            setModal(null);
+            // Mantém o modal aberto e com feedback em tempo real
+            setRenderState({ isRendering: true, progress: 5, status: 'Preparando arquivos para envio à GPU do Colab...' });
 
             try {
               const filesToSend: File[] = [];
 
-              // Áudio narração
+              // Áudio de narração
               const narCached = fileCache.current[narMedia.name];
               if (narCached) {
                 filesToSend.push(narCached);
@@ -1770,7 +1774,7 @@ export default function App() {
                 filesToSend.push(new File([b], narMedia.name, { type: narMedia.type }));
               }
 
-              // Roteiro e timeline
+              // Timeline completa e sincronizada com todas as cenas ordenadas
               const tlData = {
                 tipo: 'render',
                 duracao_total: duration,
@@ -1793,12 +1797,20 @@ export default function App() {
                 audio: narMedia.name,
               };
               filesToSend.push(new File([JSON.stringify(tlData, null, 2)], 'timeline.json', { type: 'application/json' }));
-              filesToSend.push(new File(['[cena 1] render'], 'roteiro.txt', { type: 'text/plain' }));
 
-              // Imagens e vídeos
+              // Roteiro estruturado com todas as cenas (compatibilidade com sessões ativas do Colab)
+              const roteiroCompleto = videoClips
+                .map((_, i) => `[cena ${i + 1}]\nCena ${i + 1}`)
+                .join('\n\n');
+              filesToSend.push(new File([roteiroCompleto], 'roteiro.txt', { type: 'text/plain' }));
+
+              // Imagens e vídeos de todas as cenas (sem duplicar arquivos de mesma mídia)
+              const addedMedia = new Set<string>();
               for (const clip of videoClips) {
                 const m = library.find((x) => x.id === clip.mediaId);
-                if (!m) continue;
+                if (!m || addedMedia.has(m.name)) continue;
+                addedMedia.add(m.name);
+
                 const cached = fileCache.current[m.name];
                 if (cached) {
                   filesToSend.push(cached);
@@ -1838,7 +1850,7 @@ export default function App() {
                   await localWorkspace.saveFileToCurrentWorkspace('video_final.mp4', res.videoBlob);
                 }
 
-                setRenderState({ isRendering: false, progress: 100, status: '✅ Vídeo renderizado pela GPU com sucesso!' });
+                setRenderState({ isRendering: false, progress: 100, status: '✅ Vídeo renderizado pela GPU com sucesso! O download foi iniciado.' });
               }
             } catch (err: any) {
               setRenderState({ isRendering: false, progress: 0, status: `Erro na GPU: ${err.message}` });
@@ -1851,8 +1863,6 @@ export default function App() {
           setModal('motor');
           alert('Por favor, conecte o Motor de Dobra (Colab GPU) com a URL do túnel ngrok para renderizar o vídeo.');
           return;
-
-
         }}
         onRenderBrowser={async () => {
           const videoClips = clips.filter((c) => c.trackId === 'video-1').sort((a, b) => a.startTime - b.startTime);
@@ -2010,6 +2020,81 @@ export default function App() {
           if (info.gpu) setMotorGpu(info.gpu);
         }}
       />
+
+      {/* Widget flutuante de progresso se o modal de exportação estiver fechado */}
+      {renderState.isRendering && modal !== 'export' && (
+        <div
+          style={{
+            position: 'fixed',
+            bottom: 24,
+            right: 24,
+            background: 'rgba(13, 19, 31, 0.95)',
+            border: '1px solid #00f0ff',
+            boxShadow: '0 0 25px rgba(0, 240, 255, 0.3)',
+            borderRadius: 12,
+            padding: '12px 16px',
+            zIndex: 99999,
+            minWidth: 300,
+            maxWidth: 380,
+            backdropFilter: 'blur(8px)',
+            fontFamily: 'sans-serif',
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ fontSize: 16 }}>⚡</span>
+              <strong style={{ color: '#00f0ff', fontSize: 12 }}>Renderizando na GPU (Colab)</strong>
+            </div>
+            <button
+              onClick={() => setModal('export')}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                color: '#38bdf8',
+                fontSize: 11,
+                cursor: 'pointer',
+                textDecoration: 'underline',
+                padding: '0 4px',
+              }}
+            >
+              Expandir
+            </button>
+          </div>
+
+          <div
+            style={{
+              height: 6,
+              background: '#1e293b',
+              borderRadius: 3,
+              overflow: 'hidden',
+              marginBottom: 6,
+            }}
+          >
+            <div
+              style={{
+                width: `${Math.max(5, renderState.progress)}%`,
+                height: '100%',
+                background: '#00f0ff',
+                transition: 'width 0.3s ease',
+              }}
+            />
+          </div>
+
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#cbd5e1' }}>
+            <span
+              style={{
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                maxWidth: 240,
+              }}
+            >
+              {renderState.status}
+            </span>
+            <strong style={{ color: '#00f0ff', marginLeft: 8 }}>{renderState.progress}%</strong>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

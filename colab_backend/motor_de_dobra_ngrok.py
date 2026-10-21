@@ -226,42 +226,112 @@ def mapeia_timeline(palavras, duracao_audio, blocos, cb_status=None):
 # 4. RENDERIZADOR FFMPEG
 # ==============================================================================
 def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4, cb_status=None):
-    if cb_status: cb_status("render", "Gerando cortes e aplicando efeitos FFmpeg...", 60)
+    if cb_status: cb_status("render", "Gerando cortes e aplicando efeitos FFmpeg na GPU...", 60)
     tmp_dir = tempfile.mkdtemp(prefix='motor_render_')
     
     try:
         clips_processados = []
+        midias_visuais = sorted([f for f in os.listdir(pasta_job) if eh_visual(f)])
+
         for i, cena in enumerate(instrucoes):
-            if i < len(instrucoes) - 1:
+            # Duração exata do corte
+            if 'duration' in cena and float(cena['duration']) > 0:
+                dur_real = float(cena['duration'])
+            elif 'end' in cena and 'start' in cena and float(cena['end']) > float(cena['start']):
+                dur_real = float(cena['end']) - float(cena['start'])
+            elif i < len(instrucoes) - 1:
                 dur_real = instrucoes[i + 1]['start'] - cena['start']
             else:
                 dur_real = duracao_audio - cena['start']
             dur_real = max(dur_real, 0.1)
 
             id_cena = cena.get('id_cena', f"{i+1:04d}")
+            arquivo = cena.get('arquivo', None)
             src = None
             
-            # Busca arquivo na pasta
-            id_str = str(id_cena).strip().lower()
-            for f in os.listdir(pasta_job):
-                if eh_visual(f):
+            # 1. Correspondência exata pelo nome do arquivo declarado na timeline
+            if arquivo:
+                for f in os.listdir(pasta_job):
+                    if f.lower() == str(arquivo).lower():
+                        src = os.path.join(pasta_job, f)
+                        break
+                if not src:
+                    for f in os.listdir(pasta_job):
+                        if eh_visual(f) and nome_base_sem_ext(f) == nome_base_sem_ext(arquivo):
+                            src = os.path.join(pasta_job, f)
+                            break
+
+            # 2. Correspondência por ID da cena (ex: 0001, 1, cena_0001)
+            if not src:
+                id_str = str(id_cena).strip().lower()
+                for f in midias_visuais:
                     base = nome_base_sem_ext(f)
                     if base == id_str or base.lstrip('0') == id_str.lstrip('0') or id_str in base:
                         src = os.path.join(pasta_job, f)
                         break
 
+            # 3. Fallback sequencial pelo índice da cena
+            if not src and i < len(midias_visuais):
+                src = os.path.join(pasta_job, midias_visuais[i])
+
             dst = os.path.join(tmp_dir, f"cena_{i:04d}.mp4")
 
-            if not src:
+            if not src or not os.path.exists(src):
+                print(f"      ⚠️ Imagem não encontrada para cena {i+1} ({id_cena}) -> gerando fundo preto")
                 subprocess.run([
                     'ffmpeg', '-y', '-f', 'lavfi',
                     '-i', f'color=black:size={RESOLUCAO[0]}x{RESOLUCAO[1]}:duration={dur_real}',
-                    '-r', str(FPS), dst
+                    '-r', str(FPS), '-pix_fmt', 'yuv420p', dst
                 ], capture_output=True)
                 clips_processados.append({'path': dst, 'duration': dur_real})
                 continue
 
-            # Processamento visual FFmpeg
+            # Processamento visual FFmpeg (Fit, Efeitos de Câmera, Filtros)
+            fit        = cena.get('fit', 'contain')
+            efeito     = cena.get('effect', 'none')
+            filtro     = cena.get('filter', 'none')
+            filtro_int = int(cena.get('filter_intensity', 100))
+            transicao  = cena.get('transition', 'none')
+            trans_dur  = float(cena.get('transition_duration', 0.8))
+
+            vf_parts = []
+            if fit == 'cover':
+                vf_parts.append(f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=increase,crop={RESOLUCAO[0]}:{RESOLUCAO[1]}")
+            else:
+                vf_parts.append(f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=decrease,pad={RESOLUCAO[0]}:{RESOLUCAO[1]}:(ow-iw)/2:(oh-ih)/2:black")
+
+            nb_frames = int(dur_real * FPS)
+            if nb_frames < 1: nb_frames = 1
+
+            if efeito in ('kenburns', 'zoom_in'):
+                vf_parts.append(f"zoompan=z='min(zoom+0.0008,1.1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={FPS}")
+            elif efeito == 'zoom_out':
+                vf_parts.append(f"zoompan=z='if(eq(on\\,1)\\,1.1\\,max(zoom-0.0008\\,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={FPS}")
+            elif efeito == 'pan_right':
+                vf_parts.append(f"zoompan=z=1.1:x='if(eq(on\\,1)\\,0\\,x+0.5)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={FPS}")
+            elif efeito == 'pan_left':
+                vf_parts.append(f"zoompan=z=1.1:x='if(eq(on\\,1)\\,iw*0.1-iw/zoom/2\\,x-0.5)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={FPS}")
+
+            intensidade = filtro_int / 100.0
+            if filtro == 'grayscale': vf_parts.append("hue=s=0")
+            elif filtro == 'sepia': vf_parts.append("colorchannelmixer=rr=0.393:rg=0.769:rb=0.189:gr=0.349:gg=0.686:gb=0.168:br=0.272:bg=0.534:bb=0.131")
+            elif filtro == 'blur': vf_parts.append(f"gblur=sigma={max(1, int(filtro_int / 10))}")
+            elif filtro == 'contrast': vf_parts.append(f"eq=contrast={1.0 + intensidade:.2f}")
+            elif filtro == 'saturate': vf_parts.append(f"hue=s={1.0 + intensidade * 2:.2f}")
+
+            fade_dur = min(trans_dur, dur_real * 0.4, 1.5)
+            if transicao in ('dissolve', 'crossfade', 'fade', 'fadeblack', 'slideleft', 'slideright', 'slideup', 'slidedown', 'wipeleft', 'wiperight'):
+                vf_parts.append(f"fade=t=in:st=0:d={fade_dur:.2f}")
+                if dur_real > fade_dur * 2:
+                    vf_parts.append(f"fade=t=out:st={dur_real - fade_dur:.2f}:d={fade_dur:.2f}")
+            elif transicao == 'fadewhite':
+                vf_parts.append(f"fade=t=in:st=0:d={fade_dur:.2f}:color=white")
+                if dur_real > fade_dur * 2:
+                    vf_parts.append(f"fade=t=out:st={dur_real - fade_dur:.2f}:d={fade_dur:.2f}:color=white")
+
+            vf_parts.append(f"fps={FPS}")
+            vf_chain = ",".join(vf_parts)
+
             is_video = eh_video(src)
             cmd = ['ffmpeg', '-y']
             if is_video:
@@ -269,26 +339,42 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
             else:
                 cmd.extend(['-loop', '1'])
 
-            vf = f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=decrease,pad={RESOLUCAO[0]}:{RESOLUCAO[1]}:(ow-iw)/2:(oh-ih)/2:black,fps={FPS}"
             cmd.extend([
                 '-i', src, '-t', str(dur_real),
-                '-vf', vf,
+                '-vf', vf_chain,
                 '-c:v', 'libx264', '-preset', 'fast',
-                '-pix_fmt', 'yuv420p', '-an', dst
+                '-pix_fmt', 'yuv420p',
+                '-video_track_timescale', '90000',
+                '-an', dst
             ])
-            subprocess.run(cmd, capture_output=True)
+            res = subprocess.run(cmd, capture_output=True)
+
+            if res.returncode != 0:
+                # Fallback simples em caso de erro nos filtros complexos
+                cmd_fallback = ['ffmpeg', '-y']
+                if is_video: cmd_fallback.extend(['-stream_loop', '-1'])
+                else: cmd_fallback.extend(['-loop', '1'])
+                vf_simple = f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=decrease,pad={RESOLUCAO[0]}:{RESOLUCAO[1]}:(ow-iw)/2:(oh-ih)/2:black,fps={FPS}"
+                cmd_fallback.extend([
+                    '-i', src, '-t', str(dur_real),
+                    '-vf', vf_simple,
+                    '-c:v', 'libx264', '-preset', 'fast',
+                    '-pix_fmt', 'yuv420p', '-an', dst
+                ])
+                subprocess.run(cmd_fallback, capture_output=True)
+
             clips_processados.append({'path': dst, 'duration': dur_real})
 
         if cb_status: cb_status("render", "Concatenando timeline de vídeo...", 80)
         concat_txt = os.path.join(tmp_dir, 'concat.txt')
-        with open(concat_txt, 'w') as f:
+        with open(concat_txt, 'w', encoding='utf-8') as f:
             for clip in clips_processados:
                 f.write(f"file '{clip['path']}'\n")
 
         v_temp = os.path.join(tmp_dir, 'video_sem_audio.mp4')
         subprocess.run([
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
-            '-i', concat_txt, '-c', 'copy', v_temp
+            '-i', concat_txt, '-c', 'copy', '-fflags', '+genpts', v_temp
         ], capture_output=True)
 
         if cb_status: cb_status("render", "Mixando áudio e gerando MP4 final...", 90)
@@ -300,7 +386,7 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                 bgm_path = os.path.join(pasta_job, f)
                 break
 
-        if bgm_path:
+        if bgm_path and os.path.exists(bgm_path):
             subprocess.run([
                 'ffmpeg', '-y', '-i', v_temp, '-i', audio_path, '-i', bgm_path,
                 '-filter_complex', '[1:a]volume=1.0[a1];[2:a]volume=0.2[a2];[a1][a2]amix=inputs=2:duration=first[aout]',
@@ -391,79 +477,94 @@ def processa_job_background(job_id: str, tipo: str):
         if not audio_path:
             raise FileNotFoundError("Nenhum arquivo de áudio principal (.mp3/.wav/etc) foi enviado no job")
 
-        # Acha roteiro
-        roteiro_path = None
-        for f in os.listdir(pasta_job):
-            if get_ext(f) in ['.txt', '.md'] or 'roteiro' in f.lower():
-                roteiro_path = os.path.join(pasta_job, f)
-                break
-        if not roteiro_path:
-            raise FileNotFoundError("Arquivo de roteiro (.txt/.md) não encontrado")
+        # Verifica se já temos timeline.json pronta (enviada diretamente pelo App na renderização)
+        timeline_enviada = os.path.join(pasta_job, "timeline.json")
+        usando_timeline_pronta = False
+        instrucoes = []
+        duracao_audio = 0.0
 
-        with open(roteiro_path, 'r', encoding='utf-8') as f:
-            conteudo_roteiro = f.read()
+        if tipo == 'render' and os.path.exists(timeline_enviada):
+            try:
+                with open(timeline_enviada, 'r', encoding='utf-8') as f:
+                    tl_pronta = json.load(f)
+                if 'cenas' in tl_pronta and len(tl_pronta['cenas']) > 0:
+                    instrucoes = tl_pronta['cenas']
+                    duracao_audio = float(tl_pronta.get('duracao_total', 0.0))
+                    usando_timeline_pronta = True
+                    print(f"🎬 Usando timeline enviada pelo App: {len(instrucoes)} cenas")
+            except Exception as e:
+                print(f"⚠️ Erro ao ler timeline.json enviada: {e}")
 
-        total_visuais = len([f for f in os.listdir(pasta_job) if eh_visual(f)])
-        blocos = le_roteiro_conteudo(conteudo_roteiro, total_visuais)
+        if not usando_timeline_pronta:
+            # Acha roteiro
+            roteiro_path = None
+            for f in os.listdir(pasta_job):
+                if get_ext(f) in ['.txt', '.md'] or 'roteiro' in f.lower():
+                    roteiro_path = os.path.join(pasta_job, f)
+                    break
+            if not roteiro_path:
+                raise FileNotFoundError("Arquivo de roteiro (.txt/.md) não encontrado")
 
-        # Transcrição Whisper
-        palavras, duracao_audio = transcreve_audio(audio_path, cb)
+            with open(roteiro_path, 'r', encoding='utf-8') as f:
+                conteudo_roteiro = f.read()
 
-        # Mapeamento
-        instrucoes = mapeia_timeline(palavras, duracao_audio, blocos, cb)
+            total_visuais = len([f for f in os.listdir(pasta_job) if eh_visual(f)])
+            blocos = le_roteiro_conteudo(conteudo_roteiro, total_visuais)
 
-        # Mapeia mídias visuais da pasta para cada cena
-        midias_visuais = sorted([f for f in os.listdir(pasta_job) if eh_visual(f)])
+            # Transcrição Whisper
+            palavras, duracao_audio = transcreve_audio(audio_path, cb)
 
-        def acha_midia_job(id_cena, idx):
-            id_str = str(id_cena).strip().lower()
-            # 1. Correspondência exata de nome base (ex: 0001 == 0001.png ou 1 == 0001.jpg)
-            for f in midias_visuais:
-                base = nome_base_sem_ext(f)
-                if base == id_str or base.lstrip('0') == id_str.lstrip('0'):
+            # Mapeamento
+            instrucoes = mapeia_timeline(palavras, duracao_audio, blocos, cb)
+
+            # Mapeia mídias visuais da pasta para cada cena
+            midias_visuais = sorted([f for f in os.listdir(pasta_job) if eh_visual(f)])
+
+            def acha_midia_job(id_cena, idx):
+                id_str = str(id_cena).strip().lower()
+                for f in midias_visuais:
+                    base = nome_base_sem_ext(f)
+                    if base == id_str or base.lstrip('0') == id_str.lstrip('0'):
+                        return f, ('video' if eh_video(f) else 'imagem')
+                for f in midias_visuais:
+                    base = nome_base_sem_ext(f)
+                    if id_str in base or (id_str.lstrip('0') and id_str.lstrip('0') in base):
+                        return f, ('video' if eh_video(f) else 'imagem')
+                if idx < len(midias_visuais):
+                    f = midias_visuais[idx]
                     return f, ('video' if eh_video(f) else 'imagem')
-            # 2. Correspondência se id contido no nome
-            for f in midias_visuais:
-                base = nome_base_sem_ext(f)
-                if id_str in base or (id_str.lstrip('0') and id_str.lstrip('0') in base):
-                    return f, ('video' if eh_video(f) else 'imagem')
-            # 3. Fallback sequencial por índice
-            if idx < len(midias_visuais):
-                f = midias_visuais[idx]
-                return f, ('video' if eh_video(f) else 'imagem')
-            return f"{id_cena}.jpg", 'imagem'
+                return f"{id_cena}.jpg", 'imagem'
 
-        # Gera timeline.json
-        cenas_json = []
-        for i, c in enumerate(instrucoes):
-            dur_real = instrucoes[i+1]['start'] - c['start'] if i < len(instrucoes)-1 else duracao_audio - c['start']
-            nome_arquivo, tipo_m = acha_midia_job(c['id_cena'], i)
-            cenas_json.append({
-                "id_cena": c['id_cena'],
-                "arquivo": nome_arquivo,
-                "tipo": tipo_m,
-                "start": c['start'],
-                "end": c['end'],
-                "duration": c['duration'],
-                "duration_real": round(max(dur_real, 0.1), 3),
-                "score": c['score'],
-                "startTime": c['start'],
-                "trackId": "video-1"
-            })
+            cenas_json = []
+            for i, c in enumerate(instrucoes):
+                dur_real = instrucoes[i+1]['start'] - c['start'] if i < len(instrucoes)-1 else duracao_audio - c['start']
+                nome_arquivo, tipo_m = acha_midia_job(c['id_cena'], i)
+                cenas_json.append({
+                    "id_cena": c['id_cena'],
+                    "arquivo": nome_arquivo,
+                    "tipo": tipo_m,
+                    "start": c['start'],
+                    "end": c['end'],
+                    "duration": c['duration'],
+                    "duration_real": round(max(dur_real, 0.1), 3),
+                    "score": c['score'],
+                    "startTime": c['start'],
+                    "trackId": "video-1"
+                })
 
-        timeline_data = {
-            "versao": "4.2",
-            "gerado_por": f"Motor de Dobra 4.2 (ngrok API) / Whisper {WHISPER_MODEL}",
-            "timestamp": datetime.now().isoformat(),
-            "audio": os.path.basename(audio_path),
-            "duracao_total": round(duracao_audio, 3),
-            "total_cenas": len(instrucoes),
-            "cenas": cenas_json
-        }
+            timeline_data = {
+                "versao": "4.2",
+                "gerado_por": f"Motor de Dobra 4.2 (ngrok API) / Whisper {WHISPER_MODEL}",
+                "timestamp": datetime.now().isoformat(),
+                "audio": os.path.basename(audio_path),
+                "duracao_total": round(duracao_audio, 3),
+                "total_cenas": len(instrucoes),
+                "cenas": cenas_json
+            }
 
-        saida_json = os.path.join(pasta_job, "timeline.json")
-        with open(saida_json, 'w', encoding='utf-8') as f:
-            json.dump(timeline_data, f, ensure_ascii=False, indent=2)
+            saida_json = os.path.join(pasta_job, "timeline.json")
+            with open(saida_json, 'w', encoding='utf-8') as f:
+                json.dump(timeline_data, f, ensure_ascii=False, indent=2)
 
         # Renderização em MP4 se solicitada
         if tipo in ['timeline_e_render', 'render']:

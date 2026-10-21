@@ -6,10 +6,16 @@ interface SendToMotorModalProps {
   isOpen: boolean;
   onClose: () => void;
   driveReady: boolean;
+  motorOnline?: boolean;
+  motorGpu?: string;
+  onOpenMotorConfig?: () => void;
+  activeWorkspaceName?: string | null;
+  onPickWorkspace?: () => void;
   aiFiles: AiFiles;
   aiStatus: AiStatus;
   onFileChange: (e: React.ChangeEvent<HTMLInputElement>, type: 'audio' | 'roteiro' | 'images' | 'bgm') => void;
   onSubmitJob: () => void;
+  onSubmitDirectJob?: () => void;
   isInIframe?: boolean;
   onOpenFloatingWindow?: () => void;
   onOpenOAuthHelp?: () => void;
@@ -19,21 +25,29 @@ export const SendToMotorModal: React.FC<SendToMotorModalProps> = ({
   isOpen,
   onClose,
   driveReady,
+  motorOnline = false,
+  motorGpu,
+  onOpenMotorConfig,
+  activeWorkspaceName,
+  onPickWorkspace,
   aiFiles,
   aiStatus,
   onFileChange,
   onSubmitJob,
+  onSubmitDirectJob,
   isInIframe = false,
   onOpenFloatingWindow,
   onOpenOAuthHelp,
 }) => {
   if (!isOpen) return null;
 
+  const isReady = motorOnline || driveReady;
+
   return (
     <div className="modal-overlay" onClick={() => !aiStatus.running && onClose()}>
-      <div className="modal animate-fade" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 520 }}>
+      <div className="modal animate-fade" onClick={(e) => e.stopPropagation()} style={{ maxWidth: 540 }}>
         <div className="modal-header">
-          <span className="modal-title">✦ Enviar ao Motor de Dobra</span>
+          <span className="modal-title">✦ Enviar ao Motor de Dobra 4.2</span>
           {!aiStatus.running && (
             <button className="btn btn-ghost" style={{ padding: '2px 6px' }} onClick={onClose}>
               ✕
@@ -41,70 +55,118 @@ export const SendToMotorModal: React.FC<SendToMotorModalProps> = ({
           )}
         </div>
         <div className="modal-body">
-          {!driveReady && (
+          {/* Status da Conexão com o Motor */}
+          {motorOnline ? (
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                padding: '10px 14px',
+                background: 'rgba(34, 197, 94, 0.1)',
+                border: '1px solid rgba(34, 197, 94, 0.3)',
+                borderRadius: 6,
+                marginBottom: 14,
+                fontSize: 12,
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#22c55e', boxShadow: '0 0 8px #22c55e' }} />
+                <div>
+                  <strong style={{ color: '#22c55e' }}>Motor Direto Online (Colab GPU)</strong>
+                  <div style={{ color: 'var(--muted)', fontSize: 11, marginTop: 1 }}>
+                    {motorGpu ? `GPU: ${motorGpu}` : 'GPU Pronta'} • Sem necessidade de Google Drive
+                  </div>
+                </div>
+              </div>
+              {onOpenMotorConfig && (
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  style={{ fontSize: 11, padding: '3px 8px' }}
+                  onClick={onOpenMotorConfig}
+                >
+                  ⚙️ Configurar
+                </button>
+              )}
+            </div>
+          ) : (
             <div
               style={{
                 color: 'var(--text)',
                 fontSize: 12,
                 marginBottom: 14,
-                padding: '10px 14px',
-                background: 'rgba(255, 170, 0, 0.08)',
+                padding: '12px 14px',
+                background: 'rgba(56, 189, 248, 0.08)',
                 borderRadius: 6,
-                border: '1px solid rgba(255, 170, 0, 0.3)',
+                border: '1px solid rgba(56, 189, 248, 0.3)',
                 lineHeight: 1.5,
               }}
             >
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, color: 'var(--accent2)', marginBottom: 4 }}>
-                <span>⚠️</span>
-                <span>{isInIframe ? 'Restrição de OAuth 2.0 em Iframe' : 'Google Drive Desconectado'}</span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontWeight: 700, color: '#38bdf8', marginBottom: 4 }}>
+                <span>⚡</span>
+                <span>Conecte o Motor de Dobra (Colab GPU)</span>
               </div>
-              <div>
-                {isInIframe
-                  ? 'O Google bloqueia o login OAuth dentro de iframes (ambiente AI Studio ou portal). Abra o aplicativo em Janela Flutuante para conectar sua conta e enviar jobs ao Drive normalmente.'
-                  : 'O Google Drive ainda não está conectado. Conecte pelo botão "Drive" no topo para enviar jobs.'}
+              <div style={{ color: 'var(--muted)', marginBottom: 8 }}>
+                Cole a URL do túnel ngrok gerada no Colab para processar os arquivos do seu PC direto na GPU.
               </div>
-              {isInIframe && onOpenFloatingWindow && (
+              {onOpenMotorConfig && (
                 <button
                   type="button"
-                  className="btn btn-gold"
+                  className="btn btn-primary"
                   style={{
-                    marginTop: 8,
                     width: '100%',
                     fontSize: 12,
-                    padding: '6px 12px',
+                    padding: '7px 12px',
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
                     gap: 6,
+                    fontWeight: 600,
                   }}
-                  onClick={onOpenFloatingWindow}
+                  onClick={onOpenMotorConfig}
                 >
-                  <span>⧉</span> Abrir em Janela Flutuante para Conectar ao Drive
-                </button>
-              )}
-              {onOpenOAuthHelp && (
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  style={{
-                    marginTop: 6,
-                    width: '100%',
-                    fontSize: 11,
-                    padding: '4px 8px',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: 6,
-                    color: 'var(--accent2)',
-                    textDecoration: 'underline',
-                  }}
-                  onClick={onOpenOAuthHelp}
-                >
-                  <span>🛠️</span> Resolver Erro 400 (origin_mismatch) / Configurar Origens
+                  <span>⚡</span> Conectar Motor via ngrok (Recomendado)
                 </button>
               )}
             </div>
           )}
+
+          {/* Atalho de Pasta de Trabalho do PC */}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '8px 12px',
+              background: 'var(--surface-hover, rgba(255,255,255,0.03))',
+              border: '1px solid var(--border)',
+              borderRadius: 6,
+              marginBottom: 14,
+              fontSize: 12,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span>📁</span>
+              <span style={{ color: 'var(--text)' }}>
+                {activeWorkspaceName ? (
+                  <>Pasta Local: <strong style={{ color: 'var(--accent)' }}>{activeWorkspaceName}</strong></>
+                ) : (
+                  'Carregar todos os arquivos de uma pasta do PC'
+                )}
+              </span>
+            </div>
+            {onPickWorkspace && (
+              <button
+                type="button"
+                className="btn btn-ghost"
+                style={{ fontSize: 11, padding: '3px 8px', border: '1px solid var(--border)' }}
+                onClick={onPickWorkspace}
+              >
+                {activeWorkspaceName ? 'Trocar Pasta' : 'Escolher Pasta'}
+              </button>
+            )}
+          </div>
 
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 14 }}>
             {/* áudio */}
@@ -186,11 +248,10 @@ export const SendToMotorModal: React.FC<SendToMotorModalProps> = ({
               lineHeight: 1.6,
             }}
           >
-            <strong style={{ color: 'var(--accent2)' }}>Como funciona:</strong> Os arquivos de mídia (imagens e vídeos) serão enviados ao Google Drive na pasta{' '}
-            <span className="mono" style={{ color: 'var(--text)' }}>
-              MotorDobra/fila/
-            </span>
-            . O Motor de Dobra 4.0 rodando no Colab reconhecerá tanto imagens quanto vídeos e devolverá a timeline sincronizada.
+            <strong style={{ color: motorOnline ? '#22c55e' : 'var(--accent2)' }}>
+              ⚡ Processamento na GPU (Colab):
+            </strong>{' '}
+            Os arquivos selecionados (ou da sua pasta de trabalho) são enviados diretamente para a GPU do Colab via túnel ngrok. O resultado é calculado em tempo real e salvo automaticamente de volta no seu PC!
           </div>
 
           {aiStatus.running && (
@@ -213,7 +274,7 @@ export const SendToMotorModal: React.FC<SendToMotorModalProps> = ({
 
           {aiStatus.step === 'aguardando' && (
             <div style={{ color: 'var(--success)', fontSize: 12, marginBottom: 10 }}>
-              ✅ Job enviado com sucesso! Acompanhe o progresso em "📡 Jobs".
+              ✅ Processamento iniciado com sucesso na GPU!
             </div>
           )}
 
@@ -222,17 +283,21 @@ export const SendToMotorModal: React.FC<SendToMotorModalProps> = ({
               Cancelar
             </button>
             <button
-              className="btn btn-gold"
+              className={motorOnline ? 'btn btn-primary' : 'btn btn-gold'}
               disabled={
-                !driveReady ||
+                !isReady ||
                 !aiFiles.audio ||
                 !aiFiles.roteiro ||
                 aiFiles.images.length === 0 ||
                 aiStatus.running
               }
-              onClick={onSubmitJob}
+              onClick={motorOnline && onSubmitDirectJob ? onSubmitDirectJob : onSubmitJob}
             >
-              {aiStatus.running ? '⟳ Enviando...' : '✦ Enviar ao Motor'}
+              {aiStatus.running
+                ? '⟳ Processando...'
+                : motorOnline
+                ? '⚡ Disparar na GPU (ngrok)'
+                : '✦ Enviar ao Motor'}
             </button>
           </div>
         </div>

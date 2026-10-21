@@ -36,6 +36,9 @@ import { SendToMotorModal } from './components/Modals/SendToMotorModal';
 import { JobsModal } from './components/Modals/JobsModal';
 import { ExportModal } from './components/Modals/ExportModal';
 import { GoogleOAuthModal } from './components/Modals/GoogleOAuthModal';
+import { MotorNgrokModal } from './components/Modals/MotorNgrokModal';
+import { motorApi, MotorStatusInfo } from './services/motorApi';
+import { localWorkspace } from './services/localWorkspace';
 
 export default function App() {
   // Auth
@@ -56,8 +59,13 @@ export default function App() {
   const [driveReady, setDriveReady] = useState(false);
   const [folderIds, setFolderIds] = useState<FolderIds>({});
 
+  // Motor GPU (ngrok) & Workspace
+  const [motorOnline, setMotorOnline] = useState<boolean>(false);
+  const [motorGpu, setMotorGpu] = useState<string>('');
+  const [workspaceName, setWorkspaceName] = useState<string | null>(() => localWorkspace.getActiveFolderName());
+
   // UI modais
-  const [modal, setModal] = useState<null | 'ai' | 'export' | 'jobs' | 'oauth'>(null);
+  const [modal, setModal] = useState<null | 'ai' | 'export' | 'jobs' | 'oauth' | 'motor'>(null);
 
   // IA / upload
   const [aiFiles, setAiFiles] = useState<AiFiles>({
@@ -200,24 +208,28 @@ export default function App() {
 
   const initGoogleAuth = useCallback(() => {
     const gWindow = window as any;
-    if (!gWindow.google) {
+    if (!gWindow.google?.accounts?.oauth2) {
       setTimeout(initGoogleAuth, 500);
       return;
     }
-    tokenClientRef.current = gWindow.google.accounts.oauth2.initTokenClient({
-      client_id: clientId,
-      scope: SCOPE,
-      callback: async (resp: any) => {
-        if (resp.error) {
-          setAuthState('error');
-          if (isInIframe) {
-            setIframeOAuthWarning(true);
+    try {
+      tokenClientRef.current = gWindow.google.accounts.oauth2.initTokenClient({
+        client_id: clientId,
+        scope: SCOPE,
+        callback: async (resp: any) => {
+          if (resp.error) {
+            setAuthState('error');
+            if (isInIframe) {
+              setIframeOAuthWarning(true);
+            }
+            return;
           }
-          return;
-        }
-        await onTokenAcquired(resp.access_token);
-      },
-    });
+          await onTokenAcquired(resp.access_token);
+        },
+      });
+    } catch (e) {
+      console.warn('Google Auth Token Client não inicializado:', e);
+    }
   }, [clientId, isInIframe, onTokenAcquired]);
 
   useEffect(() => {
@@ -489,6 +501,288 @@ export default function App() {
     }
   };
 
+  // ── MOTOR GPU (NGROK) STATUS CHECK ───────────────────────────────────────
+  useEffect(() => {
+    const checkMotor = async () => {
+      const res = await motorApi.testConnection();
+      setMotorOnline(res.online);
+      if (res.online && res.gpu) {
+        setMotorGpu(res.gpu);
+      }
+    };
+    checkMotor();
+    const interval = setInterval(checkMotor, 15000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // ── SELECIONAR PASTA LOCAL DO PC (WORKSPACE) ──────────────────────────────
+  const handlePickWorkspace = async () => {
+    try {
+      const res = await localWorkspace.pickDirectory();
+      setWorkspaceName(res.folderName);
+      setAiFiles({
+        audio: res.audioFile || null,
+        roteiro: res.scriptFile || null,
+        images: res.mediaFiles,
+        bgm: null,
+      });
+
+      const novasMedias: MediaItem[] = [];
+      for (let i = 0; i < res.mediaFiles.length; i++) {
+        const f = res.mediaFiles[i];
+        const url = URL.createObjectURL(f);
+        const id = `workspace-media-${i}-${Date.now()}`;
+        fileCache.current[f.name] = f;
+        const isVid = isVideoFile(f.name, f.type);
+        novasMedias.push({
+          id,
+          name: f.name,
+          type: f.type || (isVid ? 'video/mp4' : 'image/jpeg'),
+          url,
+          duration: 5,
+        });
+      }
+
+      if (res.audioFile) {
+        const f = res.audioFile;
+        const url = URL.createObjectURL(f);
+        fileCache.current[f.name] = f;
+        novasMedias.push({
+          id: `workspace-audio-${Date.now()}`,
+          name: f.name,
+          type: f.type || 'audio/mp3',
+          url,
+          duration: 60,
+        });
+      }
+
+      if (novasMedias.length > 0) {
+        setLibrary((prev) => {
+          const existentes = new Set(prev.map((m) => m.name.toLowerCase()));
+          const novas = novasMedias.filter((m) => !existentes.has(m.name.toLowerCase()));
+          return [...prev, ...novas];
+        });
+      }
+
+      if (res.timelineFile) {
+        try {
+          const text = await res.timelineFile.text();
+          const json = JSON.parse(text);
+          if (json.cenas && confirm(`Encontrado um timeline.json salvo na pasta "${res.folderName}". Deseja carregar essa timeline agora?`)) {
+            aplicaTimelineNoEditor(json);
+          }
+        } catch {}
+      }
+
+      alert(`✅ Pasta do PC "${res.folderName}" conectada!\n• ${res.mediaFiles.length} arquivos visuais\n• ${res.audioFile ? `1 áudio (${res.audioFile.name})` : 'Nenhum áudio detectado'}\n• ${res.scriptFile ? `1 roteiro (${res.scriptFile.name})` : 'Nenhum roteiro detectado'}`);
+    } catch (err: any) {
+      if (err.message && !err.message.includes('cancelada')) {
+        alert('Erro ao selecionar pasta do PC: ' + err.message);
+      }
+    }
+  };
+
+  // ── APLICAR TIMELINE.JSON NO EDITOR ───────────────────────────────────────
+  const aplicaTimelineNoEditor = (tl: any) => {
+    const newClips: ClipItem[] = [];
+    const extraLibrary: MediaItem[] = [];
+
+    setLibrary((prevLib) => {
+      // Pega todas as mídias visuais disponíveis com URL válida
+      const visualMedias = prevLib.filter((m) => !isAudioFile(m.name, m.type) && m.url && !m.placeholder);
+      visualMedias.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+
+      tl.cenas.forEach((cena: any, i: number) => {
+        const arqNome = (cena.arquivo || '').toLowerCase().trim();
+        const baseNome = arqNome.replace(/\.[^/.]+$/, '');
+        const idStr = String(cena.id_cena || i + 1).toLowerCase().trim();
+        const idSemZero = idStr.replace(/^0+/, '');
+
+        // 1. Busca por nome exato do arquivo (ex: '0001.jpg')
+        let matched = visualMedias.find((m) => m.name.toLowerCase() === arqNome);
+
+        // 2. Busca por nome base sem extensão (ex: '0001')
+        if (!matched && baseNome) {
+          matched = visualMedias.find((m) => m.name.toLowerCase().replace(/\.[^/.]+$/, '') === baseNome);
+        }
+
+        // 3. Busca por id_cena contido no nome (ex: cena 1 / '0001')
+        if (!matched && idStr) {
+          matched = visualMedias.find((m) => {
+            const b = m.name.toLowerCase().replace(/\.[^/.]+$/, '');
+            return b === idStr || b === idSemZero || b.includes(idStr) || (idSemZero && b.includes(idSemZero));
+          });
+        }
+
+        // 4. Fallback sequencial inteligente: garante que TODAS as cenas tenham imagem/vídeo
+        if (!matched && visualMedias.length > 0) {
+          matched = visualMedias[i % visualMedias.length];
+        }
+
+        let mediaId: string;
+        if (matched) {
+          mediaId = matched.id;
+        } else {
+          mediaId = `placeholder-${i}-${Date.now()}`;
+          const isVid = cena.tipo === 'video' || isVideoFile(cena.arquivo || '');
+          extraLibrary.push({
+            id: mediaId,
+            name: cena.arquivo || `Cena ${i + 1}`,
+            type: isVid ? 'video/mp4' : 'image/jpeg',
+            url: null,
+            duration: cena.duration,
+            placeholder: true,
+          });
+        }
+
+        newClips.push({
+          id: `clip-${i}-${Date.now()}`,
+          mediaId,
+          trackId: 'video-1',
+          startTime: cena.start,
+          duration: cena.duration_real || cena.duration,
+          offset: 0,
+          fit: 'contain',
+          transition: 'none',
+          transitionDuration: 0.8,
+          effect: 'none',
+          filter: 'none',
+          filterIntensity: 100,
+          fadeIn: 0,
+          fadeOut: 0,
+          volume: 1.0,
+        });
+      });
+
+      const audioMedia = prevLib.find((m) => isAudioFile(m.name, m.type) && m.url);
+      if (audioMedia) {
+        newClips.push({
+          id: `clip-audio-${Date.now()}`,
+          mediaId: audioMedia.id,
+          trackId: 'audio-1',
+          startTime: 0,
+          duration: tl.duracao_total,
+          offset: 0,
+          fit: 'contain',
+          transition: 'none',
+          transitionDuration: 0.8,
+          effect: 'none',
+          filter: 'none',
+          filterIntensity: 100,
+          fadeIn: 0,
+          fadeOut: 0,
+          volume: 1.0,
+        });
+      }
+
+      return extraLibrary.length > 0 ? [...prevLib, ...extraLibrary] : prevLib;
+    });
+
+    setPast([]);
+    setFuture([]);
+    setClips(newClips);
+    setDuration(tl.duracao_total + 10);
+    setCurrentTime(0);
+  };
+
+  // ── ENVIAR JOB DIRETO PARA O MOTOR (NGROK GPU) ───────────────────────────
+  const enviaJobDireto = async () => {
+    if (!aiFiles.audio || !aiFiles.roteiro || aiFiles.images.length === 0) {
+      alert('Selecione pelo menos uma narração (áudio), um roteiro (.txt) e imagens/vídeos.');
+      return;
+    }
+
+    // Garante que todas as mídias selecionadas estejam na biblioteca com URLs locais ativas
+    const mediasGarantidas: MediaItem[] = [];
+    if (aiFiles.audio) {
+      const f = aiFiles.audio;
+      fileCache.current[f.name] = f;
+      const url = URL.createObjectURL(f);
+      mediasGarantidas.push({
+        id: `local-audio-${Date.now()}`,
+        name: f.name,
+        type: f.type || 'audio/mp3',
+        url,
+        duration: 60,
+      });
+    }
+
+    for (let i = 0; i < aiFiles.images.length; i++) {
+      const f = aiFiles.images[i];
+      fileCache.current[f.name] = f;
+      const url = URL.createObjectURL(f);
+      const isVid = isVideoFile(f.name, f.type);
+      mediasGarantidas.push({
+        id: `local-media-${i}-${Date.now()}`,
+        name: f.name,
+        type: f.type || (isVid ? 'video/mp4' : 'image/jpeg'),
+        url,
+        duration: 5,
+      });
+    }
+
+    if (aiFiles.bgm) {
+      const f = aiFiles.bgm;
+      fileCache.current[f.name] = f;
+      const url = URL.createObjectURL(f);
+      mediasGarantidas.push({
+        id: `local-bgm-${Date.now()}`,
+        name: f.name,
+        type: f.type || 'audio/mp3',
+        url,
+        duration: 60,
+      });
+    }
+
+    setLibrary((prev) => {
+      const nomes = new Set(prev.filter((m) => m.url && !m.placeholder).map((m) => m.name.toLowerCase()));
+      const novas = mediasGarantidas.filter((m) => !nomes.has(m.name.toLowerCase()));
+      return novas.length > 0 ? [...prev, ...novas] : prev;
+    });
+
+    setAiStatus({
+      step: 'iniciando',
+      msg: 'Enviando arquivos diretamente para a GPU do Colab via túnel ngrok...',
+      pct: 5,
+      running: true,
+      error: '',
+    });
+
+    try {
+      const filesToSend: File[] = [aiFiles.audio, aiFiles.roteiro, ...aiFiles.images];
+      if (aiFiles.bgm) filesToSend.push(aiFiles.bgm);
+
+      const res = await motorApi.enviarJob(filesToSend, 'timeline', (msg, pct) => {
+        setAiStatus((p) => ({ ...p, msg, pct, running: true, error: '' }));
+      });
+
+      if (res.timeline) {
+        aplicaTimelineNoEditor(res.timeline);
+
+        if (localWorkspace.hasActiveHandle()) {
+          await localWorkspace.saveFileToCurrentWorkspace('timeline.json', JSON.stringify(res.timeline, null, 2));
+        }
+
+        setAiStatus({
+          step: 'concluido',
+          msg: '✅ Timeline calculada com sucesso pela GPU e carregada!',
+          pct: 100,
+          running: false,
+          error: '',
+        });
+        setTimeout(() => setModal(null), 1200);
+      }
+    } catch (err: any) {
+      setAiStatus({
+        step: 'erro',
+        msg: '',
+        pct: 0,
+        running: false,
+        error: `Erro no Motor de Dobra: ${err.message}`,
+      });
+    }
+  };
+
   // ── IMPORTAR TIMELINE.JSON DO DRIVE ────────────────────────────────────────
   const importaTimeline = async (jobFolderId: string, _jobName: string) => {
     try {
@@ -499,89 +793,8 @@ export default function App() {
         return;
       }
       const tl = await driveApi.readJson(tlFile.id);
-
-      const newClips: ClipItem[] = [];
-      const extraLibrary: MediaItem[] = [];
-
-      setLibrary((prevLib) => {
-        const byName: Record<string, string> = {};
-        prevLib.forEach((m) => {
-          byName[m.name.toLowerCase()] = m.id;
-        });
-
-        tl.cenas.forEach((cena: any, i: number) => {
-          const nomeNorm = cena.arquivo.toLowerCase();
-          let mediaId = byName[nomeNorm];
-
-          if (!mediaId) {
-            mediaId = `placeholder-${i}-${Date.now()}`;
-            const isVid = cena.tipo === 'video' || isVideoFile(cena.arquivo);
-            extraLibrary.push({
-              id: mediaId,
-              name: cena.arquivo,
-              type: isVid ? 'video/mp4' : 'image/jpeg',
-              url: null,
-              duration: cena.duration,
-              placeholder: true,
-            });
-            byName[nomeNorm] = mediaId;
-          }
-
-          newClips.push({
-            id: `clip-${i}-${Date.now()}`,
-            mediaId,
-            trackId: 'video-1',
-            startTime: cena.start,
-            duration: cena.duration_real || cena.duration,
-            offset: 0,
-            fit: 'contain',
-            transition: 'none',
-            transitionDuration: 0.8,
-            effect: 'none',
-            filter: 'none',
-            filterIntensity: 100,
-            fadeIn: 0,
-            fadeOut: 0,
-            volume: 1.0,
-          });
-        });
-
-        const audioMedia = prevLib.find((m) => isAudioFile(m.name, m.type));
-        if (audioMedia) {
-          newClips.push({
-            id: `clip-audio-${Date.now()}`,
-            mediaId: audioMedia.id,
-            trackId: 'audio-1',
-            startTime: 0,
-            duration: tl.duracao_total,
-            offset: 0,
-            fit: 'contain',
-            transition: 'none',
-            transitionDuration: 0.8,
-            effect: 'none',
-            filter: 'none',
-            filterIntensity: 100,
-            fadeIn: 0,
-            fadeOut: 0,
-            volume: 1.0,
-          });
-        }
-
-        return extraLibrary.length > 0 ? [...prevLib, ...extraLibrary] : prevLib;
-      });
-
-      setPast([]);
-      setFuture([]);
-      setClips(newClips);
-      setDuration(tl.duracao_total + 10);
-      setCurrentTime(0);
-
-      const faltando = extraLibrary.length;
-      const msg =
-        faltando > 0
-          ? `✅ Timeline importada! ${tl.total_cenas} cenas | score: ${tl.score_medio}\n\n⚠️ ${faltando} imagens não encontradas na biblioteca.\nFaça upload pelo "+" para aparecerem no preview.`
-          : `✅ Timeline importada! ${tl.total_cenas} cenas | score: ${tl.score_medio}`;
-      alert(msg);
+      aplicaTimelineNoEditor(tl);
+      alert(`✅ Timeline importada do Drive! ${tl.total_cenas} cenas | score: ${tl.score_medio}`);
     } catch (e: any) {
       alert('Erro ao importar timeline: ' + e.message);
     }
@@ -1140,20 +1353,43 @@ export default function App() {
     }
   }, [fullscreen]);
 
-  // ── RECONECTA MÍDIAS DA BIBLIOTECA PELO NOME ────────────────────────────────
+  // ── RECONECTA MÍDIAS DA BIBLIOTECA PELO NOME / POSIÇÃO ─────────────────────
   useEffect(() => {
     if (library.length === 0) return;
-    setClips((prevClips) =>
-      prevClips.map((clip) => {
+    const visualMedias = library.filter((m) => !isAudioFile(m.name, m.type) && m.url && !m.placeholder);
+    visualMedias.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+
+    setClips((prevClips) => {
+      let visualIdx = 0;
+      return prevClips.map((clip) => {
         const currentMedia = library.find((m) => m.id === clip.mediaId);
-        if (currentMedia?.url) return clip;
-        const byName = library.find(
-          (m) => m.url && !m.placeholder && m.name.toLowerCase() === (currentMedia?.name || '').toLowerCase()
-        );
-        if (byName) return { ...clip, mediaId: byName.id };
+        if (currentMedia?.url && !currentMedia.placeholder) return clip;
+
+        if (clip.trackId === 'audio-1') {
+          const audioM = library.find((m) => isAudioFile(m.name, m.type) && m.url);
+          if (audioM) return { ...clip, mediaId: audioM.id };
+          return clip;
+        }
+
+        const clipName = (currentMedia?.name || '').toLowerCase().trim();
+        const baseName = clipName.replace(/\.[^/.]+$/, '');
+
+        // 1. Nome exato
+        let matched = visualMedias.find((m) => m.name.toLowerCase() === clipName);
+        // 2. Nome base sem extensão
+        if (!matched && baseName) {
+          matched = visualMedias.find((m) => m.name.toLowerCase().replace(/\.[^/.]+$/, '') === baseName);
+        }
+        // 3. Fallback sequencial
+        if (!matched && visualMedias.length > 0) {
+          matched = visualMedias[visualIdx % visualMedias.length];
+        }
+        visualIdx++;
+
+        if (matched) return { ...clip, mediaId: matched.id };
         return clip;
-      })
-    );
+      });
+    });
   }, [library]);
 
   const handleFiles = async (e: React.ChangeEvent<HTMLInputElement>, type: 'audio' | 'roteiro' | 'images' | 'bgm') => {
@@ -1232,130 +1468,20 @@ export default function App() {
         onLoadProject={carregaProjetoLocal}
         onSaveProject={salvaProjetoLocal}
         hasSavedProject={temProjetoSalvo}
-        jobsCount={jobs.length}
-        onOpenJobs={async () => {
-          if (authState !== 'ok') {
-            try {
-              await autenticaSeNecessario();
-            } catch {
-              return;
-            }
-          }
-          setModal('jobs');
-        }}
         onOpenAi={() => setModal('ai')}
         onOpenExport={() => setModal('export')}
         motorStatus={mStatus}
         isInIframe={isInIframe}
         onOpenFloatingWindow={handleOpenFloatingWindow}
         onOpenOAuthHelp={() => setModal('oauth')}
+        motorOnline={motorOnline}
+        motorGpu={motorGpu}
+        onOpenMotorConfig={() => setModal('motor')}
+        workspaceName={workspaceName}
+        onPickWorkspace={handlePickWorkspace}
       />
 
-      {/* ── BANNER DE ERRO DE AUTORIZAÇÃO / ORIGIN MISMATCH (ERRO 400) ── */}
-      {authState === 'error' && (
-        <div
-          style={{
-            background: 'linear-gradient(90deg, #3d1414, #2b0b0b)',
-            borderBottom: '1px solid #ef4444',
-            padding: '8px 16px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: 12,
-            fontSize: 12,
-            color: '#fca5a5',
-            zIndex: 100,
-            boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
-            flexShrink: 0,
-          }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontSize: 16 }}>⚠️</span>
-            <span>
-              <strong>Acesso Bloqueado pelo Google (Erro 400: origin_mismatch):</strong> A URL deste domínio precisa ser adicionada em <em>"Origens JavaScript autorizadas"</em> no Google Cloud Console.
-            </span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-            <button
-              className="btn btn-primary"
-              style={{
-                fontSize: 11,
-                padding: '4px 12px',
-                background: '#ef4444',
-                border: 'none',
-                color: '#fff',
-                fontWeight: 600,
-                display: 'flex',
-                alignItems: 'center',
-                gap: 5,
-                cursor: 'pointer',
-              }}
-              onClick={() => setModal('oauth')}
-            >
-              <span>🛠️</span> Resolver Erro 400 / Configurar Origem
-            </button>
-            <button
-              className="btn btn-ghost"
-              style={{ fontSize: 13, padding: '2px 6px', color: '#fca5a5' }}
-              onClick={() => setAuthState('idle')}
-              title="Fechar aviso"
-            >
-              ✕
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* ── BANNER DE AVISO QUANDO O GOOGLE BLOQUEIA OAUTH NO IFRAME ── */}
-      {iframeOAuthWarning && authState !== 'error' && (
-        <div
-          style={{
-            background: 'linear-gradient(90deg, #2b1d03, #3d2402)',
-            borderBottom: '1px solid var(--accent2)',
-            padding: '7px 16px',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            gap: 12,
-            fontSize: 12,
-            color: '#ffdd80',
-            zIndex: 100,
-            boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
-            flexShrink: 0,
-          }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <span style={{ fontSize: 16 }}>⚠️</span>
-            <span>
-              <strong>Restrição de Iframe do Google OAuth 2.0:</strong> O Google bloqueia o login dentro de iframes (ambiente de teste AI Studio ou portais incorporados). Abra o aplicativo em Janela Flutuante para conectar o Drive sem restrições.
-            </span>
-          </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
-            <button
-              className="btn btn-gold"
-              style={{ fontSize: 11, padding: '4px 10px', display: 'flex', alignItems: 'center', gap: 5 }}
-              onClick={handleOpenFloatingWindow}
-            >
-              <span>⧉</span> Abrir Janela Flutuante
-            </button>
-            <button
-              className="btn btn-ghost"
-              style={{ fontSize: 11, padding: '4px 8px', color: '#ffdd80', textDecoration: 'underline' }}
-              onClick={() => setModal('oauth')}
-            >
-              🛠️ Ajuda OAuth
-            </button>
-            <button
-              className="btn btn-ghost"
-              style={{ fontSize: 13, padding: '2px 6px', color: '#ffdd80' }}
-              onClick={() => setIframeOAuthWarning(false)}
-              title="Fechar aviso"
-            >
-              ✕
-            </button>
-          </div>
-        </div>
-      )}
+      {/* ── CORPO PRINCIPAL ── */}
 
       {/* ── CORPO PRINCIPAL ── */}
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
@@ -1575,10 +1701,16 @@ export default function App() {
         isOpen={modal === 'ai'}
         onClose={() => setModal(null)}
         driveReady={driveReady}
+        motorOnline={motorOnline}
+        motorGpu={motorGpu}
+        onOpenMotorConfig={() => setModal('motor')}
+        activeWorkspaceName={workspaceName}
+        onPickWorkspace={handlePickWorkspace}
         aiFiles={aiFiles}
         aiStatus={aiStatus}
         onFileChange={handleFiles}
         onSubmitJob={enviaJob}
+        onSubmitDirectJob={enviaJobDireto}
         isInIframe={isInIframe}
         onOpenFloatingWindow={handleOpenFloatingWindow}
         onOpenOAuthHelp={() => setModal('oauth')}
@@ -1607,15 +1739,6 @@ export default function App() {
           a.click();
         }}
         onRenderColab={async () => {
-          try {
-            await autenticaSeNecessario();
-          } catch {
-            return;
-          }
-          if (!driveReady || !folderIds.fila) {
-            alert('Drive não conectado.');
-            return;
-          }
           const videoClips = clips.filter((c) => c.trackId === 'video-1');
           const narClip = clips.find((c) => c.trackId === 'audio-1');
           const bgmClip = clips.find((c) => c.trackId === 'audio-2');
@@ -1630,101 +1753,106 @@ export default function App() {
             return;
           }
 
-          setRenderState({ isRendering: true, progress: 0, status: 'Criando job no Drive...' });
-          setModal(null);
-
-          try {
-            const jobName = `render_${Date.now()}`;
-            const jobId = await driveApi.getOrCreateFolder(folderIds.fila, jobName);
-
-            const getFile = async (media: MediaItem, nomeSaida?: string) => {
-              const cached = fileCache.current[media.name];
-              if (cached) return new File([cached], nomeSaida || media.name, { type: cached.type });
-              if (media.url) {
-                const resp = await fetch(media.url);
-                const blob = await resp.blob();
-                return new File([blob], nomeSaida || media.name, { type: media.type });
-              }
-              return null;
-            };
-
-            for (let i = 0; i < videoClips.length; i++) {
-              const clip = videoClips[i];
-              const media = library.find((m) => m.id === clip.mediaId);
-              if (!media) continue;
-              setRenderState((p) => ({ ...p, status: `Enviando imagem ${i + 1}/${videoClips.length}...` }));
-              const file = await getFile(media, media.name);
-              if (file) await driveApi.uploadFile(jobId, file, media.name);
-            }
-
-            if (narClip) {
-              const nMedia = library.find((m) => m.id === narClip.mediaId);
-              if (nMedia) {
-                setRenderState((p) => ({ ...p, status: 'Enviando áudio...' }));
-                const ext = getFileExtension(nMedia.name) || 'mp3';
-                const file = await getFile(nMedia, `audio.${ext}`);
-                if (file) await driveApi.uploadFile(jobId, file, `audio.${ext}`);
-              }
-            }
-
-            if (bgmClip) {
-              const bMedia = library.find((m) => m.id === bgmClip.mediaId);
-              if (bMedia) {
-                setRenderState((p) => ({ ...p, status: 'Enviando música de fundo...' }));
-                const ext = getFileExtension(bMedia.name) || 'mp3';
-                const file = await getFile(bMedia, `bgm.${ext}`);
-                if (file) await driveApi.uploadFile(jobId, file, `bgm.${ext}`);
-              }
-            }
-
-            const tlData = {
-              tipo: 'render',
-              duracao_total: duration,
-              cenas: videoClips.map((clip, i) => {
-                const media = library.find((m) => m.id === clip.mediaId);
-                return {
-                  id_cena: String(i + 1).padStart(4, '0'),
-                  arquivo: media?.name || `${String(i + 1).padStart(4, '0')}.jpg`,
-                  start: clip.startTime,
-                  end: clip.startTime + clip.duration,
-                  duration: clip.duration,
-                  fit: clip.fit || 'contain',
-                  transition: clip.transition || 'none',
-                  transition_duration: clip.transitionDuration ?? 0.8,
-                  effect: clip.effect || 'none',
-                  filter: clip.filter || 'none',
-                  filter_intensity: clip.filterIntensity ?? 100,
-                };
-              }),
-              audio: narClip
-                ? 'audio.' + (getFileExtension(library.find((m) => m.id === narClip.mediaId)?.name) || 'mp3')
-                : null,
-              audio_volume: narClip ? getClipVolume(narClip, 1.0) : 1.0,
-              audio_fade_in: narClip ? narClip.fadeIn || 0 : 0,
-              audio_fade_out: narClip ? narClip.fadeOut || 0 : 0,
-              bgm: bgmClip
-                ? 'bgm.' + (getFileExtension(library.find((m) => m.id === bgmClip.mediaId)?.name) || 'mp3')
-                : null,
-              bgm_volume: bgmClip ? getClipVolume(bgmClip, 0.2) : 0.2,
-              bgm_fade_in: bgmClip ? bgmClip.fadeIn || 0 : 0,
-              bgm_fade_out: bgmClip ? bgmClip.fadeOut || 0 : 0,
-              bgm_ducking: true,
-            };
-            await driveApi.uploadJson(jobId, 'timeline_render.json', tlData);
-
-            await driveApi.uploadJson(jobId, 'job.json', {
-              tipo: 'render',
-              audio: tlData.audio,
-              roteiro: null,
-              timeline_pronta: 'timeline_render.json',
-              criado_em: new Date().toISOString(),
-            });
-
+          if (motorOnline) {
+            setRenderState({ isRendering: true, progress: 5, status: 'Preparando arquivos para a GPU do Colab...' });
             setModal(null);
-            alert('✅ Job de render enviado ao Motor de Dobra!\nAcompanhe em "📡 Jobs".');
-          } catch (e: any) {
-            alert('Erro ao enviar job: ' + e.message);
+
+            try {
+              const filesToSend: File[] = [];
+
+              // Áudio narração
+              const narCached = fileCache.current[narMedia.name];
+              if (narCached) {
+                filesToSend.push(narCached);
+              } else {
+                const resp = await fetch(narMedia.url);
+                const b = await resp.blob();
+                filesToSend.push(new File([b], narMedia.name, { type: narMedia.type }));
+              }
+
+              // Roteiro e timeline
+              const tlData = {
+                tipo: 'render',
+                duracao_total: duration,
+                cenas: videoClips.map((clip, i) => {
+                  const media = library.find((m) => m.id === clip.mediaId);
+                  return {
+                    id_cena: String(i + 1).padStart(4, '0'),
+                    arquivo: media?.name || `${String(i + 1).padStart(4, '0')}.jpg`,
+                    start: clip.startTime,
+                    end: clip.startTime + clip.duration,
+                    duration: clip.duration,
+                    fit: clip.fit || 'contain',
+                    transition: clip.transition || 'none',
+                    transition_duration: clip.transitionDuration ?? 0.8,
+                    effect: clip.effect || 'none',
+                    filter: clip.filter || 'none',
+                    filter_intensity: clip.filterIntensity ?? 100,
+                  };
+                }),
+                audio: narMedia.name,
+              };
+              filesToSend.push(new File([JSON.stringify(tlData, null, 2)], 'timeline.json', { type: 'application/json' }));
+              filesToSend.push(new File(['[cena 1] render'], 'roteiro.txt', { type: 'text/plain' }));
+
+              // Imagens e vídeos
+              for (const clip of videoClips) {
+                const m = library.find((x) => x.id === clip.mediaId);
+                if (!m) continue;
+                const cached = fileCache.current[m.name];
+                if (cached) {
+                  filesToSend.push(cached);
+                } else if (m.url) {
+                  const resp = await fetch(m.url);
+                  const b = await resp.blob();
+                  filesToSend.push(new File([b], m.name, { type: m.type }));
+                }
+              }
+
+              // BGM opcional
+              if (bgmClip) {
+                const bMedia = library.find((m) => m.id === bgmClip.mediaId);
+                if (bMedia) {
+                  const bCached = fileCache.current[bMedia.name];
+                  if (bCached) filesToSend.push(bCached);
+                  else if (bMedia.url) {
+                    const resp = await fetch(bMedia.url);
+                    const b = await resp.blob();
+                    filesToSend.push(new File([b], bMedia.name, { type: bMedia.type }));
+                  }
+                }
+              }
+
+              const res = await motorApi.enviarJob(filesToSend, 'render', (msg, pct) => {
+                setRenderState({ isRendering: true, progress: pct, status: msg });
+              });
+
+              if (res.videoBlob) {
+                const url = URL.createObjectURL(res.videoBlob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'video_final.mp4';
+                a.click();
+
+                if (localWorkspace.hasActiveHandle()) {
+                  await localWorkspace.saveFileToCurrentWorkspace('video_final.mp4', res.videoBlob);
+                }
+
+                setRenderState({ isRendering: false, progress: 100, status: '✅ Vídeo renderizado pela GPU com sucesso!' });
+              }
+            } catch (err: any) {
+              setRenderState({ isRendering: false, progress: 0, status: `Erro na GPU: ${err.message}` });
+              alert(`Erro na renderização da GPU: ${err.message}`);
+            }
+            return;
           }
+
+          // Se o motor ngrok não estiver conectado, solicita a conexão sem disparar OAuth
+          setModal('motor');
+          alert('Por favor, conecte o Motor de Dobra (Colab GPU) com a URL do túnel ngrok para renderizar o vídeo.');
+          return;
+
+
         }}
         onRenderBrowser={async () => {
           const videoClips = clips.filter((c) => c.trackId === 'video-1').sort((a, b) => a.startTime - b.startTime);
@@ -1872,6 +2000,15 @@ export default function App() {
         onSaveClientId={handleSaveClientId}
         onManualToken={handleManualToken}
         onRetryAuth={() => autenticaSeNecessario().catch(() => {})}
+      />
+
+      <MotorNgrokModal
+        isOpen={modal === 'motor'}
+        onClose={() => setModal(null)}
+        onConnected={(info) => {
+          setMotorOnline(info.online);
+          if (info.gpu) setMotorGpu(info.gpu);
+        }}
       />
     </div>
   );

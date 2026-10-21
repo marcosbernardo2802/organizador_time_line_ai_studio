@@ -27,13 +27,27 @@ Este diretório contém o código oficial do **motor de dobra 4.1 AI Studio**, s
 
 ---
 
-## 📋 Como Atualizar no Google Colab
+## 📂 Arquivos Disponíveis
 
-⚠️ **ATENÇÃO: Sempre que este arquivo backend for alterado, você deve atualizar a célula no seu Colab:**
+1. **`motor_de_dobra_ngrok.py` (Versão 4.2 — NOVO)**:
+   - **Modo Direto via túnel ngrok** (Sem dependência de Google Drive e sem OAuth).
+   - Card interativo com botão **"Copiar URL" -> "Copiado!"**.
+   - Campo para colar a chave/authtoken do ngrok no cabeçalho do Colab (`# @param {type:"string"}`).
+   - Bypass automático de confirmação do navegador via cabeçalho `ngrok-skip-browser-warning`.
+
+2. **`motor_de_dobra.py` (Versão 4.1 — BACKUP)**:
+   - Modo clássico baseado em monitoramento de pastas no Google Drive (`drive.mount`).
+   - Mantido 100% preservado como backup de segurança.
+
+---
+
+## 📋 Como Testar a Nova Versão no Google Colab
 
 1. Abra seu notebook no [Google Colab](https://colab.research.google.com).
-2. Se a célula antiga estiver rodando, pare a execução (botão de stop ⏹️).
-3. Abra o arquivo `colab_backend/motor_de_dobra.py` aqui no editor.
+2. Se estiver com a célula antiga rodando, pare a execução (⏹️).
+3. Abra o arquivo `colab_backend/motor_de_dobra_ngrok.py`.
 4. Copie todo o código (`Ctrl + A` e `Ctrl + C`).
-5. Substitua todo o conteúdo da célula no Colab (`Ctrl + V`).
-6. Execute a célula novamente com **`Shift + Enter`**.
+5. Cole na célula do Colab (`Ctrl + V`).
+6. Cole o seu token do ngrok no campo `NGROK_AUTHTOKEN` que aparecerá no topo.
+7. Execute a célula (**`Shift + Enter`**).
+8. O Colab exibirá o card do motor com a URL e o botão interativo para copiar!

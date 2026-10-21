@@ -18,13 +18,13 @@ export const openInFloatingWindow = (onBeforeOpen?: () => void) => {
     try {
       onBeforeOpen();
     } catch (e) {
-      console.warn('Erro ao executar callback antes de abrir janela flutuante:', e);
+      console.warn('Erro ao executar callback antes de abrir janela:', e);
     }
   }
 
-  // Dimensões ideais para o editor de vídeo (proporcional à tela do usuário)
-  const screenW = window.screen.availWidth || window.innerWidth;
-  const screenH = window.screen.availHeight || window.innerHeight;
+  // Dimensões ideais para o editor de vídeo em janela popup flutuante
+  const screenW = window.screen.availWidth || window.innerWidth || 1280;
+  const screenH = window.screen.availHeight || window.innerHeight || 800;
   const targetW = Math.min(1440, Math.max(1024, Math.floor(screenW * 0.95)));
   const targetH = Math.min(920, Math.max(700, Math.floor(screenH * 0.92)));
   const left = Math.max(0, Math.floor((screenW - targetW) / 2));
@@ -43,18 +43,33 @@ export const openInFloatingWindow = (onBeforeOpen?: () => void) => {
     'scrollbars=yes',
   ].join(',');
 
-  const popupName = 'CronicasEstelaresFloatingWin';
-  
-  // Tenta abrir como janela popup flutuante
-  const win = window.open(window.location.href, popupName, features);
+  // Garante que o navegador crie uma janela nova e limpe o cache de scripts bloqueados
+  const popupName = `CronicasEditor_${Date.now()}`;
+  const baseOrigin = window.location.origin && window.location.origin !== 'null' ? window.location.origin : '';
+  const targetUrl = `${baseOrigin || window.location.href.split('?')[0]}/?v=${Date.now()}`;
 
-  if (win) {
-    try {
-      win.focus();
-    } catch {}
-  } else {
-    // Se o navegador bloquear popups com dimensões personalizadas, abre em nova aba
-    window.open(window.location.href, '_blank', 'noopener,noreferrer');
+  try {
+    const win = window.open(targetUrl, popupName, features);
+    if (win) {
+      try {
+        win.focus();
+      } catch {}
+      return;
+    }
+  } catch (e) {
+    console.warn('Erro ao abrir popup flutuante com nome único:', e);
+  }
+
+  // Fallback caso popups nomeados sejam bloqueados
+  try {
+    const win = window.open(targetUrl, '_blank', features);
+    if (win) {
+      try {
+        win.focus();
+      } catch {}
+    }
+  } catch (err) {
+    console.error('Falha ao abrir janela flutuante:', err);
   }
 };
 

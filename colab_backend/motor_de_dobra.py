@@ -13,8 +13,8 @@
 #     tiver capitalização diferente da declarada no job.json.
 # ==============================================================================
 
-print("⚙️ Motor de Dobra 4.1 AI Studio inicializando...")
-!pip install openai-whisper moviepy tqdm -q
+import sys, subprocess
+subprocess.run([sys.executable, "-m", "pip", "install", "openai-whisper", "moviepy", "tqdm", "-q"], check=False)
 
 import os, re, unicodedata, whisper, threading, time, json, shutil, subprocess, tempfile
 from datetime import datetime
@@ -88,6 +88,72 @@ def eh_imagem(filename):
 def eh_visual(filename):
     """Verifica se o arquivo é visual (vídeo OU imagem)."""
     return get_ext(filename) in EXTENSOES_VISUAIS
+
+def obtem_unidades_visuais(pasta):
+    """
+    Agrupa os arquivos visuais da pasta por nome base (sem extensão).
+    Se existirem um vídeo e uma imagem com o mesmo nome base (ex: '0001.mp4' e '0001.jpg' ou 'cena1.mov' e 'cena1.png'),
+    eles formam UMA ÚNICA unidade visual de cena:
+      - 'base': nome base padronizado (ex: '0001')
+      - 'video': nome do arquivo de vídeo (ou None)
+      - 'video_path': caminho absoluto do vídeo (ou None)
+      - 'imagem': nome do arquivo de imagem (ou None)
+      - 'image_path': caminho absoluto da imagem (ou None)
+      - 'arquivo_principal': nome do vídeo (se existir) ou da imagem
+      - 'tipo': 'video' (se tiver vídeo) senão 'imagem'
+    
+    Isso impede categoricamente que imagens complementares de vídeos sejam contadas ou processadas
+    como cenas avulsas extras jogadas no final do vídeo!
+    """
+    if not pasta or not os.path.exists(pasta):
+        return []
+
+    grupos = {}
+    arquivos = sorted(os.listdir(pasta))
+
+    for f in arquivos:
+        if not eh_visual(f) or eh_audio(f):
+            continue
+        # Ignora arquivos ocultos ou arquivos de áudio/música
+        if f.startswith('.') or nome_base_sem_ext(f).lower() in ['audio', 'bgm', 'narration']:
+            continue
+
+        base = nome_base_sem_ext(f).lower()
+        if base not in grupos:
+            grupos[base] = {
+                'base': base,
+                'video': None,
+                'video_path': None,
+                'imagem': None,
+                'image_path': None,
+                'arquivo_principal': None,
+                'tipo': 'imagem'
+            }
+
+        caminho = os.path.join(pasta, f)
+        if eh_video(f) and not grupos[base]['video']:
+            grupos[base]['video'] = f
+            grupos[base]['video_path'] = caminho
+        elif eh_imagem(f) and not grupos[base]['imagem']:
+            grupos[base]['imagem'] = f
+            grupos[base]['image_path'] = caminho
+
+    unidades = []
+    for base, info in grupos.items():
+        if info['video']:
+            info['arquivo_principal'] = info['video']
+            info['tipo'] = 'video'
+        else:
+            info['arquivo_principal'] = info['imagem']
+            info['tipo'] = 'imagem'
+        unidades.append(info)
+
+    def chave_ordenacao_natural(u):
+        partes = re.split(r'(\d+)', u['base'])
+        return [int(p) if p.isdigit() else p.lower() for p in partes]
+
+    unidades.sort(key=chave_ordenacao_natural)
+    return unidades
 
 
 # ==============================================================================
@@ -219,10 +285,8 @@ def le_roteiro(roteiro_path, pasta_projeto=None):
         linhas = [p.strip() for p in conteudo.split('\n') if p.strip()]
         n_midias = 0
         if pasta_projeto and os.path.exists(pasta_projeto):
-            n_midias = len([
-                f for f in os.listdir(pasta_projeto)
-                if eh_visual(f) and not eh_audio(f) and nome_base_sem_ext(f) not in ['audio', 'bgm']
-            ])
+            unidades = obtem_unidades_visuais(pasta_projeto)
+            n_midias = len(unidades)
 
         if n_midias > 0:
             chunk = max(1, len(linhas) // n_midias)
@@ -308,25 +372,30 @@ def mapeia_cenas(palavras, duracao_audio, blocos, pasta_job=None):
 # ==============================================================================
 def exporta_timeline_json(instrucoes, pasta_projeto, audio_path,
                            duracao_audio, saida_path):
-    def acha_midia(pasta, id_cena):
+    unidades_visuais = obtem_unidades_visuais(pasta_projeto)
+
+    def acha_midia(pasta, id_cena, idx):
         id_str = str(id_cena).strip().lower()
-        if os.path.exists(pasta):
-            # 1ª correspondência: nome base exato independente de extensão e maiúsculas
-            for f in os.listdir(pasta):
-                if not eh_visual(f):
-                    continue
-                base = nome_base_sem_ext(f)
-                if base == id_str or base.lstrip('0') == id_str.lstrip('0'):
-                    tipo = 'video' if eh_video(f) else 'imagem'
-                    return f, tipo
-            # 2ª correspondência: id_cena contido no nome base (ex: 'cena_0001.MP4')
-            for f in os.listdir(pasta):
-                if not eh_visual(f):
-                    continue
-                base = nome_base_sem_ext(f)
-                if id_str in base or (id_str.lstrip('0') and id_str.lstrip('0') in base):
-                    tipo = 'video' if eh_video(f) else 'imagem'
-                    return f, tipo
+        id_clean = id_str.lstrip('0') or '0'
+        # 1. Correspondência exata por base ou ID
+        for u in unidades_visuais:
+            b = u['base']
+            b_clean = b.lstrip('0') or '0'
+            if b == id_str or b_clean == id_clean:
+                return u['arquivo_principal'], u['tipo']
+        # 2. Correspondência parcial
+        for u in unidades_visuais:
+            b = u['base']
+            b_clean = b.lstrip('0') or '0'
+            if id_str in b or (id_clean and id_clean in b):
+                return u['arquivo_principal'], u['tipo']
+        # 3. Fallback sequencial por índice de unidades visuais
+        if idx < len(unidades_visuais):
+            u = unidades_visuais[idx]
+            return u['arquivo_principal'], u['tipo']
+        elif unidades_visuais:
+            u = unidades_visuais[idx % len(unidades_visuais)]
+            return u['arquivo_principal'], u['tipo']
         return f"{id_cena}.jpg", 'imagem'
 
     cenas_json = []
@@ -337,7 +406,7 @@ def exporta_timeline_json(instrucoes, pasta_projeto, audio_path,
             dur_real = duracao_audio - cena['start']
         dur_real = max(dur_real, 0.1)
 
-        nome_arquivo, tipo = acha_midia(pasta_projeto, cena['id_cena'])
+        nome_arquivo, tipo = acha_midia(pasta_projeto, cena['id_cena'], i)
         is_vid = (tipo == 'video') or eh_video(nome_arquivo)
 
         cenas_json.append({
@@ -377,6 +446,98 @@ def exporta_timeline_json(instrucoes, pasta_projeto, audio_path,
 # ==============================================================================
 # NÚCLEO — RENDER
 # ==============================================================================
+def obtem_duracao_midia(path: str) -> float:
+    """Obtém a duração exata de um arquivo de vídeo ou áudio em segundos via ffprobe."""
+    if not path or not os.path.exists(path):
+        return 0.0
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            path
+        ]
+        out = subprocess.check_output(cmd, text=True).strip()
+        val = float(out)
+        return max(val, 0.05)
+    except Exception:
+        try:
+            from moviepy.editor import VideoFileClip
+            with VideoFileClip(path) as clip:
+                return float(clip.duration)
+        except Exception:
+            return 0.0
+
+def renderiza_trecho_visual(src, dur, dst_path, fit='contain', efeito='none', filtro='none', filtro_int=100, transicao='none', trans_dur=0.8, slow_factor=1.0):
+    is_vid = eh_video(src)
+    vf_parts = []
+
+    if fit == 'cover':
+        vf_parts.append(f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=increase,crop={RESOLUCAO[0]}:{RESOLUCAO[1]}")
+    else:
+        vf_parts.append(f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=decrease,pad={RESOLUCAO[0]}:{RESOLUCAO[1]}:(ow-iw)/2:(oh-ih)/2:black")
+
+    if is_vid and slow_factor > 1.001:
+        vf_parts.append(f"setpts={slow_factor:.5f}*PTS")
+
+    if not is_vid:
+        nb_frames = max(1, int(dur * FPS))
+        if efeito in ('kenburns', 'zoom_in'):
+            vf_parts.append(f"zoompan=z='min(zoom+0.0008,1.1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={FPS}")
+        elif efeito == 'zoom_out':
+            vf_parts.append(f"zoompan=z='if(eq(on\\,1)\\,1.1\\,max(zoom-0.0008\\,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={FPS}")
+        elif efeito == 'pan_right':
+            vf_parts.append(f"zoompan=z=1.1:x='if(eq(on\\,1)\\,0\\,x+0.5)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={FPS}")
+        elif efeito == 'pan_left':
+            vf_parts.append(f"zoompan=z=1.1:x='if(eq(on\\,1)\\,iw*0.1-iw/zoom/2\\,x-0.5)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={FPS}")
+
+    intensidade = filtro_int / 100.0
+    if filtro == 'grayscale': vf_parts.append("hue=s=0")
+    elif filtro == 'sepia': vf_parts.append("colorchannelmixer=rr=0.393:rg=0.769:rb=0.189:gr=0.349:gg=0.686:gb=0.168:br=0.272:bg=0.534:bb=0.131")
+    elif filtro == 'blur': vf_parts.append(f"gblur=sigma={max(1, int(filtro_int / 10))}")
+    elif filtro == 'contrast': vf_parts.append(f"eq=contrast={1.0 + intensidade:.2f}")
+    elif filtro == 'saturate': vf_parts.append(f"hue=s={1.0 + intensidade * 2:.2f}")
+
+    fade_dur = min(trans_dur, dur * 0.4, 1.5)
+    if transicao in ('dissolve', 'crossfade', 'fade', 'fadeblack', 'slideleft', 'slideright', 'slideup', 'slidedown', 'wipeleft', 'wiperight'):
+        vf_parts.append(f"fade=t=in:st=0:d={fade_dur:.2f}")
+        if dur > fade_dur * 2:
+            vf_parts.append(f"fade=t=out:st={dur - fade_dur:.2f}:d={fade_dur:.2f}")
+    elif transicao == 'fadewhite':
+        vf_parts.append(f"fade=t=in:st=0:d={fade_dur:.2f}:color=white")
+        if dur > fade_dur * 2:
+            vf_parts.append(f"fade=t=out:st={dur - fade_dur:.2f}:d={fade_dur:.2f}:color=white")
+
+    vf_parts.append(f"fps={FPS}")
+    vf_chain = ",".join(vf_parts)
+
+    cmd = ['ffmpeg', '-y']
+    if is_vid: cmd.extend(['-stream_loop', '-1'])
+    else: cmd.extend(['-loop', '1'])
+
+    cmd.extend([
+        '-i', src, '-t', str(dur),
+        '-vf', vf_chain,
+        '-c:v', 'libx264', '-preset', 'fast',
+        '-pix_fmt', 'yuv420p',
+        '-video_track_timescale', '90000',
+        '-an', dst_path
+    ])
+    res = subprocess.run(cmd, capture_output=True)
+
+    if res.returncode != 0:
+        cmd_fallback = ['ffmpeg', '-y']
+        if is_vid: cmd_fallback.extend(['-stream_loop', '-1'])
+        else: cmd_fallback.extend(['-loop', '1'])
+        vf_simple = f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=decrease,pad={RESOLUCAO[0]}:{RESOLUCAO[1]}:(ow-iw)/2:(oh-ih)/2:black,fps={FPS}"
+        cmd_fallback.extend([
+            '-i', src, '-t', str(dur),
+            '-vf', vf_simple,
+            '-c:v', 'libx264', '-preset', 'fast',
+            '-pix_fmt', 'yuv420p', '-video_track_timescale', '90000', '-an', dst_path
+        ])
+        subprocess.run(cmd_fallback, capture_output=True)
+
 def renderiza(instrucoes, pasta_projeto, audio_path,
               duracao_audio, saida_path, pasta_job=None):
     if pasta_job:
@@ -387,6 +548,7 @@ def renderiza(instrucoes, pasta_projeto, audio_path,
 
     try:
         clips_processados = []
+        unidades_visuais = obtem_unidades_visuais(pasta_projeto) if pasta_projeto else []
 
         for i, cena in enumerate(tqdm(instrucoes, desc="🎬 Processando cenas")):
             if i < len(instrucoes) - 1:
@@ -404,123 +566,74 @@ def renderiza(instrucoes, pasta_projeto, audio_path,
             filtro_int = int(cena.get('filter_intensity', 100))
             fit        = cena.get('fit', 'contain')
 
-            src = None
-            if arquivo:
-                for f in os.listdir(pasta_projeto):
-                    if f.lower() == str(arquivo).lower():
-                        src = os.path.join(pasta_projeto, f)
-                        break
-                if not src:
-                    # Busca por correspondência de nome base ignorando maiúsculas/minúsculas e extensão
-                    for f in os.listdir(pasta_projeto):
-                        if eh_visual(f) and nome_base_sem_ext(f) == nome_base_sem_ext(arquivo):
-                            src = os.path.join(pasta_projeto, f)
-                            break
+            id_str = str(id_cena).strip().lower()
+            id_clean = id_str.lstrip('0') or '0'
+            base_decl = nome_base_sem_ext(arquivo).lower() if arquivo else id_str
+            base_decl_clean = base_decl.lstrip('0') or '0'
 
-            if not src:
-                id_str = str(id_cena).strip().lower()
-                for f in os.listdir(pasta_projeto):
-                    if not eh_visual(f):
-                        continue
-                    base = nome_base_sem_ext(f)
-                    if base == id_str or base.lstrip('0') == id_str.lstrip('0') or id_str in base:
-                        src = os.path.join(pasta_projeto, f)
+            unidade = None
+            for u in unidades_visuais:
+                b = u['base']
+                b_clean = b.lstrip('0') or '0'
+                if (arquivo and (arquivo.lower() == (u['video'] or '').lower() or arquivo.lower() == (u['imagem'] or '').lower())) \
+                   or b == base_decl or b_clean == base_decl_clean:
+                    unidade = u
+                    break
+
+            if not unidade:
+                for u in unidades_visuais:
+                    b = u['base']
+                    b_clean = b.lstrip('0') or '0'
+                    if b == id_str or b_clean == id_clean or id_str in b or (id_clean and id_clean in b):
+                        unidade = u
                         break
 
-            if not src:
-                print(f"      ❌ Arquivo não encontrado: cena {id_cena}")
-                dst = os.path.join(tmp_dir, f"cena_{i:04d}.mp4")
-                subprocess.run([
-                    'ffmpeg', '-y', '-f', 'lavfi',
-                    '-i', f'color=black:size={RESOLUCAO[0]}x{RESOLUCAO[1]}:duration={dur_real}',
-                    '-r', str(FPS), dst
-                ], capture_output=True)
-                clips_processados.append({'path': dst, 'duration': dur_real})
-                continue
+            if not unidade:
+                if i < len(unidades_visuais):
+                    unidade = unidades_visuais[i]
+                elif unidades_visuais:
+                    unidade = unidades_visuais[i % len(unidades_visuais)]
+
+            video_src = unidade['video_path'] if unidade else None
+            image_src = unidade['image_path'] if unidade else None
+
+            # Fallback direto se o arquivo foi informado e existe no disco
+            if not video_src and not image_src and arquivo and pasta_projeto:
+                caminho_dir = os.path.join(pasta_projeto, arquivo)
+                if os.path.exists(caminho_dir):
+                    if eh_video(arquivo): video_src = caminho_dir
+                    elif eh_imagem(arquivo): image_src = caminho_dir
 
             dst = os.path.join(tmp_dir, f"cena_{i:04d}.mp4")
-            vf_parts = []
 
-            # Scale / Fit
-            if fit == 'cover':
-                vf_parts.append(f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=increase,crop={RESOLUCAO[0]}:{RESOLUCAO[1]}")
-            else:
-                vf_parts.append(f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=decrease,pad={RESOLUCAO[0]}:{RESOLUCAO[1]}:(ow-iw)/2:(oh-ih)/2:black")
+            # Regras Vídeo vs Imagem
+            dur_vid = obtem_duracao_midia(video_src) if video_src else 0.0
 
-            # Efeito de câmera
-            fps = FPS
-            nb_frames = int(dur_real * fps)
-            if nb_frames < 1: nb_frames = 1
-
-            if efeito in ('kenburns', 'zoom_in'):
-                vf_parts.append(f"zoompan=z='min(zoom+0.0008,1.1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={fps}")
-            elif efeito == 'zoom_out':
-                vf_parts.append(f"zoompan=z='if(eq(on\\,1)\\,1.1\\,max(zoom-0.0008\\,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={fps}")
-            elif efeito == 'pan_right':
-                vf_parts.append(f"zoompan=z=1.1:x='if(eq(on\\,1)\\,0\\,x+0.5)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={fps}")
-            elif efeito == 'pan_left':
-                vf_parts.append(f"zoompan=z=1.1:x='if(eq(on\\,1)\\,iw*0.1-iw/zoom/2\\,x-0.5)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={fps}")
-
-            # Filtros de cor
-            intensidade = filtro_int / 100.0
-            if filtro == 'grayscale': vf_parts.append(f"hue=s=0")
-            elif filtro == 'sepia': vf_parts.append(f"colorchannelmixer=rr=0.393:rg=0.769:rb=0.189:gr=0.349:gg=0.686:gb=0.168:br=0.272:bg=0.534:bb=0.131")
-            elif filtro == 'blur': vf_parts.append(f"gblur=sigma={max(1, int(filtro_int / 10))}")
-            elif filtro == 'contrast': vf_parts.append(f"eq=contrast={1.0 + intensidade:.2f}")
-            elif filtro == 'saturate': vf_parts.append(f"hue=s={1.0 + intensidade * 2:.2f}")
-            elif filtro == 'invert': vf_parts.append(f"negate")
-
-            # Transições (fade)
-            fade_dur = min(trans_dur, dur_real * 0.4, 1.5)
-            if transicao in ('dissolve', 'crossfade', 'fade', 'fadeblack', 'slideleft', 'slideright', 'slideup', 'slidedown', 'wipeleft', 'wiperight'):
-                vf_parts.append(f"fade=t=in:st=0:d={fade_dur:.2f}")
-                if dur_real > fade_dur * 2:
-                    vf_parts.append(f"fade=t=out:st={dur_real - fade_dur:.2f}:d={fade_dur:.2f}")
-            elif transicao == 'fadewhite':
-                vf_parts.append(f"fade=t=in:st=0:d={fade_dur:.2f}:color=white")
-                if dur_real > fade_dur * 2:
-                    vf_parts.append(f"fade=t=out:st={dur_real - fade_dur:.2f}:d={fade_dur:.2f}:color=white")
-
-            vf_parts.append(f"fps={fps}")
-            vf_chain = ",".join(vf_parts)
-
-            is_video = eh_video(src)
-
-            # Loop automático para vídeos curtos preencherem dur_real
-            cmd = ['ffmpeg', '-y']
-            if is_video:
-                cmd.extend(['-stream_loop', '-1'])
-            else:
-                cmd.extend(['-loop', '1'])
-
-            cmd.extend([
-                '-i', src,
-                '-t', str(dur_real),
-                '-vf', vf_chain,
-                '-c:v', 'libx264', '-preset', 'fast',
-                '-pix_fmt', 'yuv420p',
-                '-video_track_timescale', '90000',
-                '-an',
-                dst
-            ])
-
-            result = subprocess.run(cmd, capture_output=True, text=True)
-
-            if result.returncode != 0:
-                print(f"      ⚠️ FFmpeg fallback sem filtros na cena {id_cena}...")
-                cmd_simple = ['ffmpeg', '-y']
-                if is_video:
-                    cmd_simple.extend(['-stream_loop', '-1'])
+            if video_src and dur_vid > 0.05:
+                # Caso A: corte se cena <= vídeo
+                if dur_real <= dur_vid:
+                    renderiza_trecho_visual(video_src, dur_real, dst, fit, efeito, filtro, filtro_int, transicao, trans_dur, slow_factor=1.0)
+                # Caso B: slow motion se até 40% maior
+                elif dur_real <= (dur_vid * 1.40):
+                    fator_slow = dur_real / dur_vid
+                    renderiza_trecho_visual(video_src, dur_real, dst, fit, efeito, filtro, filtro_int, transicao, trans_dur, slow_factor=fator_slow)
+                # Caso C: vídeo normal + completa com imagem
                 else:
-                    cmd_simple.extend(['-loop', '1'])
-
-                cmd_simple.extend([
-                    '-i', src, '-t', str(dur_real),
-                    '-vf', f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=decrease,pad={RESOLUCAO[0]}:{RESOLUCAO[1]}:(ow-iw)/2:(oh-ih)/2:black,fps={fps}",
-                    '-c:v', 'libx264', '-preset', 'fast',
-                    '-pix_fmt', 'yuv420p', '-video_track_timescale', '90000', '-an', dst
-                ])
-                subprocess.run(cmd_simple, capture_output=True)
+                    dur_p_vid = dur_vid
+                    dur_p_img = max(0.1, round(dur_real - dur_vid, 3))
+                    p1 = os.path.join(tmp_dir, f"c_{i:04d}_p1.mp4")
+                    p2 = os.path.join(tmp_dir, f"c_{i:04d}_p2.mp4")
+                    renderiza_trecho_visual(video_src, dur_p_vid, p1, fit, 'none', filtro, filtro_int, transicao, trans_dur, slow_factor=1.0)
+                    src_img = image_src if image_src else video_src
+                    renderiza_trecho_visual(src_img, dur_p_img, p2, fit, efeito, filtro, filtro_int, 'none', trans_dur, slow_factor=1.0)
+                    sub_txt = os.path.join(tmp_dir, f"sub_{i:04d}.txt")
+                    with open(sub_txt, 'w', encoding='utf-8') as f:
+                        f.write(f"file '{p1}'\nfile '{p2}'\n")
+                    subprocess.run(['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', sub_txt, '-c', 'copy', '-fflags', '+genpts', dst], capture_output=True)
+            elif image_src:
+                renderiza_trecho_visual(image_src, dur_real, dst, fit, efeito, filtro, filtro_int, transicao, trans_dur, slow_factor=1.0)
+            else:
+                subprocess.run(['ffmpeg', '-y', '-f', 'lavfi', '-i', f'color=black:size={RESOLUCAO[0]}x{RESOLUCAO[1]}:duration={dur_real}', '-r', str(FPS), dst], capture_output=True)
 
             clips_processados.append({'path': dst, 'duration': dur_real})
 

@@ -29,11 +29,24 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
 
   if (!isOpen) return null;
 
+  const normalize = (u: string) => {
+    let clean = u.trim().replace(/\/+$/, '');
+    if (clean && !clean.startsWith('http://') && !clean.startsWith('https://')) {
+      clean = `https://${clean}`;
+    }
+    if (typeof window !== 'undefined' && window.location.protocol === 'https:' && clean.startsWith('http://') && !clean.includes('localhost')) {
+      clean = clean.replace(/^http:\/\//i, 'https://');
+    }
+    return clean;
+  };
+
   const testUrl = async (urlToTest: string) => {
+    const clean = normalize(urlToTest);
+    setUrl(clean);
     setTesting(true);
     setStatusInfo(null);
     try {
-      const res = await motorApi.testConnection(urlToTest);
+      const res = await motorApi.testConnection(clean);
       setStatusInfo(res);
       if (res.online && onConnected) {
         onConnected(res);
@@ -44,7 +57,9 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
   };
 
   const handleSave = () => {
-    motorApi.setUrl(url);
+    const clean = normalize(url);
+    setUrl(clean);
+    motorApi.setUrl(clean);
     setSaveSuccess(true);
     setTimeout(() => {
       setSaveSuccess(false);

@@ -592,25 +592,43 @@ export default function App() {
       const visualMedias = prevLib.filter((m) => !isAudioFile(m.name, m.type) && m.url && !m.placeholder);
       visualMedias.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
 
+      // Helper para priorizar vídeos sobre imagens quando houver mesmo nome base
+      const matchVisualMedia = (predicate: (m: MediaItem) => boolean) => {
+        const matches = visualMedias.filter(predicate);
+        if (matches.length === 0) return undefined;
+        const videoMatch = matches.find((m) => isVideoFile(m.name, m.type));
+        return videoMatch || matches[0];
+      };
+
       tl.cenas.forEach((cena: any, i: number) => {
         const arqNome = (cena.arquivo || '').toLowerCase().trim();
         const baseNome = arqNome.replace(/\.[^/.]+$/, '');
         const idStr = String(cena.id_cena || i + 1).toLowerCase().trim();
         const idSemZero = idStr.replace(/^0+/, '');
 
-        // 1. Busca por nome exato do arquivo (ex: '0001.jpg')
+        // 1. Busca por nome exato do arquivo (ex: '0001.mp4')
         let matched = visualMedias.find((m) => m.name.toLowerCase() === arqNome);
 
-        // 2. Busca por nome base sem extensão (ex: '0001')
-        if (!matched && baseNome) {
-          matched = visualMedias.find((m) => m.name.toLowerCase().replace(/\.[^/.]+$/, '') === baseNome);
+        // Se encontrou imagem mas existe um VÍDEO com o mesmo nome base, prioriza o vídeo!
+        if (baseNome) {
+          const videoComMesmoNome = visualMedias.find(
+            (m) => isVideoFile(m.name, m.type) && m.name.toLowerCase().replace(/\.[^/.]+$/, '') === baseNome
+          );
+          if (videoComMesmoNome) {
+            matched = videoComMesmoNome;
+          }
         }
 
-        // 3. Busca por id_cena contido no nome (ex: cena 1 / '0001')
+        // 2. Busca por nome base sem extensão priorizando vídeo
+        if (!matched && baseNome) {
+          matched = matchVisualMedia((m) => m.name.toLowerCase().replace(/\.[^/.]+$/, '') === baseNome);
+        }
+
+        // 3. Busca por id_cena contido no nome priorizando vídeo
         if (!matched && idStr) {
-          matched = visualMedias.find((m) => {
+          matched = matchVisualMedia((m) => {
             const b = m.name.toLowerCase().replace(/\.[^/.]+$/, '');
-            return b === idStr || b === idSemZero || b.includes(idStr) || (idSemZero && b.includes(idSemZero));
+            return b === idStr || b === idSemZero || b.includes(idStr) || Boolean(idSemZero && b.includes(idSemZero));
           });
         }
 
@@ -1376,6 +1394,13 @@ export default function App() {
 
         // 1. Nome exato
         let matched = visualMedias.find((m) => m.name.toLowerCase() === clipName);
+        // Se encontrou imagem ou nome base, prioriza o vídeo de mesmo nome
+        if (baseName) {
+          const videoMatch = visualMedias.find(
+            (m) => isVideoFile(m.name, m.type) && m.name.toLowerCase().replace(/\.[^/.]+$/, '') === baseName
+          );
+          if (videoMatch) matched = videoMatch;
+        }
         // 2. Nome base sem extensão
         if (!matched && baseName) {
           matched = visualMedias.find((m) => m.name.toLowerCase().replace(/\.[^/.]+$/, '') === baseName);
@@ -1768,10 +1793,17 @@ export default function App() {
               const narCached = fileCache.current[narMedia.name];
               if (narCached) {
                 filesToSend.push(narCached);
+              } else if (narMedia.url) {
+                try {
+                  const resp = await fetch(narMedia.url);
+                  if (!resp.ok) throw new Error(`Status HTTP ${resp.status}`);
+                  const b = await resp.blob();
+                  filesToSend.push(new File([b], narMedia.name, { type: narMedia.type || 'audio/mpeg' }));
+                } catch (fetchErr: any) {
+                  throw new Error(`Não foi possível carregar o arquivo de áudio '${narMedia.name}' (${fetchErr.message}). Se você acabou de carregar um projeto salvo, por favor re-importe o arquivo de áudio na Biblioteca de Mídia.`);
+                }
               } else {
-                const resp = await fetch(narMedia.url);
-                const b = await resp.blob();
-                filesToSend.push(new File([b], narMedia.name, { type: narMedia.type }));
+                throw new Error(`O arquivo de áudio '${narMedia.name}' não possui dados carregados na memória. Re-importe o áudio na Biblioteca de Mídia antes de renderizar.`);
               }
 
               // Timeline completa e sincronizada com todas as cenas ordenadas
@@ -1815,9 +1847,46 @@ export default function App() {
                 if (cached) {
                   filesToSend.push(cached);
                 } else if (m.url) {
-                  const resp = await fetch(m.url);
-                  const b = await resp.blob();
-                  filesToSend.push(new File([b], m.name, { type: m.type }));
+                  try {
+                    const resp = await fetch(m.url);
+                    if (resp.ok) {
+                      const b = await resp.blob();
+                      filesToSend.push(new File([b], m.name, { type: m.type || 'image/jpeg' }));
+                    } else {
+                      console.warn(`Mídia ${m.name} retornou status ${resp.status}`);
+                    }
+                  } catch (e) {
+                    console.warn(`Aviso: não foi possível obter blob para ${m.name}:`, e);
+                  }
+                }
+
+                // Se este clip for um VÍDEO, envia também a imagem complementar de mesmo nome caso exista
+                if (isVideoFile(m.name, m.type)) {
+                  const baseName = m.name.toLowerCase().replace(/\.[^/.]+$/, '');
+                  const companionImage = library.find(
+                    (cand) =>
+                      cand.id !== m.id &&
+                      !isVideoFile(cand.name, cand.type) &&
+                      !isAudioFile(cand.name, cand.type) &&
+                      cand.name.toLowerCase().replace(/\.[^/.]+$/, '') === baseName
+                  );
+                  if (companionImage && !addedMedia.has(companionImage.name.toLowerCase())) {
+                    addedMedia.add(companionImage.name.toLowerCase());
+                    const compCached = fileCache.current[companionImage.name];
+                    if (compCached) {
+                      filesToSend.push(compCached);
+                    } else if (companionImage.url) {
+                      try {
+                        const resp = await fetch(companionImage.url);
+                        if (resp.ok) {
+                          const b = await resp.blob();
+                          filesToSend.push(new File([b], companionImage.name, { type: companionImage.type || 'image/jpeg' }));
+                        }
+                      } catch (e) {
+                        console.warn(`Aviso: não foi possível obter blob para ${companionImage.name}:`, e);
+                      }
+                    }
+                  }
                 }
               }
 
@@ -1826,11 +1895,18 @@ export default function App() {
                 const bMedia = library.find((m) => m.id === bgmClip.mediaId);
                 if (bMedia) {
                   const bCached = fileCache.current[bMedia.name];
-                  if (bCached) filesToSend.push(bCached);
-                  else if (bMedia.url) {
-                    const resp = await fetch(bMedia.url);
-                    const b = await resp.blob();
-                    filesToSend.push(new File([b], bMedia.name, { type: bMedia.type }));
+                  if (bCached) {
+                    filesToSend.push(bCached);
+                  } else if (bMedia.url) {
+                    try {
+                      const resp = await fetch(bMedia.url);
+                      if (resp.ok) {
+                        const b = await resp.blob();
+                        filesToSend.push(new File([b], bMedia.name, { type: bMedia.type || 'audio/mpeg' }));
+                      }
+                    } catch (e) {
+                      console.warn(`Aviso: BGM ${bMedia.name} não pôde ser carregado:`, e);
+                    }
                   }
                 }
               }

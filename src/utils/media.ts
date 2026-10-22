@@ -209,3 +209,206 @@ export const ACCEPT_ALL_MEDIA = [
   ...AUDIO_EXTENSIONS.map((e) => `.${e}`),
   ...AUDIO_EXTENSIONS.map((e) => `.${e.toUpperCase()}`),
 ].join(',');
+
+// ─── LEITURA ASSÍNCRONA DE DURAÇÃO REAL DE MÍDIAS ────────────────────────────
+
+/**
+ * Obtém a duração real de um arquivo de áudio ou vídeo via elemento HTML5 de mídia.
+ * Resolve com o fallback em caso de erro, duração inválida ou timeout de 8 segundos.
+ * Revoga a URL temporária e limpa o elemento em todos os caminhos. Nunca rejeita.
+ */
+export const getMediaDuration = (
+  file: File,
+  kind: 'audio' | 'video',
+  fallback: number
+): Promise<number> => {
+  return new Promise<number>((resolve) => {
+    let url = '';
+    try {
+      url = URL.createObjectURL(file);
+    } catch {
+      resolve(fallback);
+      return;
+    }
+
+    const el = document.createElement(kind);
+    el.preload = 'metadata';
+
+    let finished = false;
+    const cleanup = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      el.onloadedmetadata = null;
+      el.onerror = null;
+      try {
+        el.src = '';
+      } catch {}
+      try {
+        URL.revokeObjectURL(url);
+      } catch {}
+    };
+
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve(fallback);
+    }, 8000);
+
+    el.onloadedmetadata = () => {
+      const dur = el.duration;
+      cleanup();
+      if (typeof dur === 'number' && Number.isFinite(dur) && dur > 0) {
+        resolve(dur);
+      } else {
+        resolve(fallback);
+      }
+    };
+
+    el.onerror = () => {
+      cleanup();
+      resolve(fallback);
+    };
+
+    el.src = url;
+  });
+};
+
+/**
+ * Executa mapeamento assíncrono sobre um array em lotes de tamanho máximo especificado (ex: 6).
+ */
+export const mapInBatches = async <T, R>(
+  items: T[],
+  batchSize: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> => {
+  const results: R[] = [];
+  for (let i = 0; i < items.length; i += batchSize) {
+    const chunk = items.slice(i, i + batchSize);
+    const chunkResults = await Promise.all(chunk.map((item, idx) => fn(item, i + idx)));
+    results.push(...chunkResults);
+  }
+  return results;
+};
+
+// ─── VALIDAÇÃO DE ROTEIRO E UNIDADES VISUAIS ──────────────────────────────────
+
+const ARQUIVOS_IGNORADOS = new Set([
+  'audio', 'bgm', 'narration', 'narracao', 'voz', 'trilha', 'music', 'musica',
+  'video_final', 'video_sem_audio', 'saida', 'output', 'export', 'temp', 'preview',
+  'status', 'timeline', 'roteiro', 'sub_concat', 'concat'
+]);
+
+/**
+ * Agrupa mídias visuais por nome base (sem extensão), replicando obtem_unidades_visuais do motor.
+ * Um vídeo e uma imagem de mesmo nome base contam como UMA única unidade. Ignora arquivos de áudio.
+ */
+export const contaUnidadesVisuais = (midias: File[]): number => {
+  const grupos = new Set<string>();
+  for (const f of midias) {
+    if (!isVisualFile(f.name, f.type) || isAudioFile(f.name, f.type)) continue;
+    const name = f.name;
+    const base = getBaseName(name);
+    if (!base || name.startsWith('.') || name.startsWith('_') || ARQUIVOS_IGNORADOS.has(base)) continue;
+    if (['video_final', 'video_sem_audio', 'output_final', 'sub_concat', 'concat'].some((ign) => base.includes(ign))) {
+      continue;
+    }
+    grupos.add(base);
+  }
+  return grupos.size;
+};
+
+/**
+ * Conta os blocos do roteiro replicando le_roteiro_conteudo do motor.
+ */
+export const contaBlocosRoteiro = (
+  conteudo: string,
+  totalMidias: number = 0
+): { blocos: number; linhasApenasDigitos: string[] } => {
+  if (!conteudo || !conteudo.trim()) {
+    return { blocos: 0, linhasApenasDigitos: [] };
+  }
+
+  // Identifica linhas compostas apenas por números isolados (que o motor trata como marcador de cena)
+  const linhas = conteudo.split(/\r?\n/);
+  const linhasApenasDigitos: string[] = [];
+  for (const l of linhas) {
+    const limpa = l.trim();
+    if (/^\d+$/.test(limpa)) {
+      linhasApenasDigitos.push(limpa);
+    }
+  }
+
+  const padrao = /(?:^|\n)\s*\[?\s*(?:cena|bloco)?\s*[_:\-]?\s*(\d+)\s*\]?\s*[:\-]?\s*(?:\n|$)/i;
+  const partes = ('\n' + conteudo).split(padrao);
+  let blocosCount = 0;
+
+  for (let i = 1; i < partes.length; i += 2) {
+    const txt = i + 1 < partes.length ? partes[i + 1].trim() : '';
+    if (txt) {
+      const txtLimpo = txt.replace(/\[(?:visual|efeito|audio|camera|b-roll)[^\]]*\]/gi, '').trim();
+      if (txtLimpo || txt) {
+        blocosCount++;
+      }
+    }
+  }
+
+  if (blocosCount === 0 && conteudo.trim()) {
+    const linhasNaoVazias = linhas.map((p) => p.trim()).filter(Boolean);
+    if (totalMidias > 0) {
+      blocosCount = totalMidias;
+    } else {
+      blocosCount = linhasNaoVazias.length;
+    }
+  }
+
+  return { blocos: blocosCount, linhasApenasDigitos };
+};
+
+/**
+ * Valida o roteiro contra as mídias visuais antes do envio ao motor.
+ */
+export const validaRoteiroContraMidias = async (
+  roteiro: File | null | undefined,
+  midias: File[]
+): Promise<{ blocos: number; unidades: number; avisos: string[] }> => {
+  const avisos: string[] = [];
+  const unidades = contaUnidadesVisuais(midias || []);
+
+  if (!roteiro) {
+    avisos.push('Nenhum arquivo de roteiro selecionado.');
+    return { blocos: 0, unidades, avisos };
+  }
+
+  let conteudo = '';
+  try {
+    conteudo = await roteiro.text();
+  } catch {
+    avisos.push('Não foi possível ler o roteiro para validar.');
+    return { blocos: 0, unidades, avisos };
+  }
+
+  const { blocos, linhasApenasDigitos } = contaBlocosRoteiro(conteudo, unidades);
+
+  if (blocos === 0) {
+    avisos.push('Roteiro vazio ou sem blocos reconhecidos.');
+  }
+
+  if (unidades === 0) {
+    avisos.push('Nenhuma mídia visual encontrada.');
+  }
+
+  if (blocos > 0 && unidades > 0 && blocos !== unidades) {
+    avisos.push(
+      `O roteiro tem ${blocos} blocos, mas há ${unidades} mídias visuais. O motor vai ajustar a diferença automaticamente, e isso pode desalinhar cenas.`
+    );
+  }
+
+  if (linhasApenasDigitos.length > 0) {
+    const exemplos = Array.from(new Set(linhasApenasDigitos)).slice(0, 3).join(', ');
+    avisos.push(
+      `O roteiro contém linha(s) isolada(s) apenas com números (ex: "${exemplos}"). O motor trata essas linhas como marcador de cena.`
+    );
+  }
+
+  return { blocos, unidades, avisos };
+};

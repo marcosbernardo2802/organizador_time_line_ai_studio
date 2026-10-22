@@ -1,25 +1,15 @@
 import React from 'react';
-import { UserInfo } from '../types';
 
 interface HeaderProps {
   theme: string;
   onToggleTheme: () => void;
-  userInfo?: UserInfo | null;
-  authState?: 'idle' | 'loading' | 'ok' | 'error';
-  onAuth?: () => void;
-  onLogout?: () => void;
   onNewProject: () => void;
   onLoadProject: () => void;
   onSaveProject: () => void;
   hasSavedProject: boolean;
-  jobsCount?: number;
-  onOpenJobs?: () => void;
   onOpenAi: () => void;
   onOpenExport: () => void;
   motorStatus: { dot: string; label: string };
-  isInIframe?: boolean;
-  onOpenFloatingWindow?: () => void;
-  onOpenOAuthHelp?: () => void;
   // Motor GPU & Local Workspace
   motorOnline?: boolean;
   motorGpu?: string;
@@ -31,22 +21,13 @@ interface HeaderProps {
 export const Header: React.FC<HeaderProps> = ({
   theme,
   onToggleTheme,
-  userInfo,
-  authState,
-  onAuth,
-  onLogout,
   onNewProject,
   onLoadProject,
   onSaveProject,
   hasSavedProject,
-  jobsCount,
-  onOpenJobs,
   onOpenAi,
   onOpenExport,
   motorStatus,
-  isInIframe = false,
-  onOpenFloatingWindow,
-  onOpenOAuthHelp,
   motorOnline = false,
   motorGpu,
   onOpenMotorConfig,
@@ -78,7 +59,7 @@ export const Header: React.FC<HeaderProps> = ({
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-        {/* Conexão com o Motor de Dobra 4.2 (Colab GPU via ngrok) */}
+        {/* Conexão com o Motor de Dobra (Colab GPU via ngrok) */}
         {onOpenMotorConfig && (
           <button
             className="btn"
@@ -120,28 +101,6 @@ export const Header: React.FC<HeaderProps> = ({
           >
             <span>📁</span>
             <span>{workspaceName ? workspaceName : 'Pasta do PC'}</span>
-          </button>
-        )}
-        {/* Botão Janela Flutuante */}
-        {onOpenFloatingWindow && (
-          <button
-            className="btn"
-            style={{
-              fontSize: 11,
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: 5,
-              padding: '4px 9px',
-              background: 'var(--surface-hover, rgba(255,255,255,0.05))',
-              border: '1px solid var(--border)',
-              color: 'var(--text)',
-              cursor: 'pointer',
-            }}
-            onClick={onOpenFloatingWindow}
-            title="Abrir app em Janela Flutuante dedicada"
-          >
-            <span style={{ fontSize: 13, lineHeight: 1 }}>⧉</span>
-            <span>Janela Flutuante</span>
           </button>
         )}
 

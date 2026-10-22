@@ -106,7 +106,7 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
                 Conectar Motor de Dobra 4.2 (Colab GPU)
               </h3>
               <p style={{ margin: 0, fontSize: 12, color: '#8899aa' }}>
-                Conexão direta via túnel ngrok • Sem Google Drive • Sem erros de OAuth
+                Conexão direta via túnel ngrok • Processamento em tempo real na GPU
               </p>
             </div>
           </div>

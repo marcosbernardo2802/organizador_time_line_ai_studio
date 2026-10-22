@@ -16,6 +16,42 @@ export const AdjustmentsTab: React.FC<AdjustmentsTabProps> = ({
 }) => {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      {typeof selectedClip.score === 'number' && !isNaN(selectedClip.score) && (() => {
+        const scoreVal = selectedClip.score > 1 ? selectedClip.score / 100 : selectedClip.score;
+        const scorePct = Math.round(scoreVal * 100);
+        const scoreColor = scoreVal >= 0.8 ? '#10b981' : scoreVal >= 0.6 ? '#f59e0b' : '#ef4444';
+        return (
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              padding: '8px 10px',
+              borderRadius: 3,
+              background: 'var(--bg)',
+              border: `1px solid ${scoreColor}40`,
+              color: scoreColor,
+              fontSize: 12,
+              fontWeight: 700,
+              fontFamily: 'Rajdhani, sans-serif',
+            }}
+          >
+            <span
+              style={{
+                width: 7,
+                height: 7,
+                borderRadius: '50%',
+                backgroundColor: scoreColor,
+                display: 'inline-block',
+                flexShrink: 0,
+                boxShadow: `0 0 6px ${scoreColor}`,
+              }}
+            />
+            <span>Confiança do alinhamento: {scorePct}%</span>
+          </div>
+        );
+      })()}
+
       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
         <label style={{ fontSize: 11, color: 'var(--muted)', fontWeight: 600 }}>DURAÇÃO DO CLIP (Segundos)</label>
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>

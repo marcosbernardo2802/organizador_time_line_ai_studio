@@ -1,12 +1,14 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { RenderState } from '../../types';
+import { FormatoRender, QualidadeRender } from '../../services/motorApi';
+import { EtapasProgresso } from '../EtapasProgresso';
 
 interface ExportModalProps {
   isOpen: boolean;
   onClose: () => void;
   renderState: RenderState;
   onExportJson: () => void;
-  onRenderColab: () => void;
+  onRenderColab: (opcoes: { formato: FormatoRender; qualidade: QualidadeRender }) => void;
   onRenderBrowser: () => void;
   motorOnline?: boolean;
   onOpenMotorModal?: () => void;
@@ -22,6 +24,10 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   motorOnline = false,
   onOpenMotorModal,
 }) => {
+  // Estado local para formato e qualidade de renderização no Colab
+  const [formato, setFormato] = useState<FormatoRender>('16:9');
+  const [qualidade, setQualidade] = useState<QualidadeRender>('1080p');
+
   if (!isOpen) return null;
 
   return (
@@ -92,6 +98,14 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 {renderState.status || 'Enviando arquivos e iniciando GPU...'}
               </div>
 
+              <EtapasProgresso
+                etapas={renderState.etapas}
+                etapaIndice={renderState.etapaIndice}
+                etapaTotal={renderState.etapaTotal}
+                detalhe={renderState.detalhe}
+                etaSegundos={renderState.etaSegundos}
+              />
+
               <div style={{ fontSize: 11, color: '#94a3b8' }}>
                 💡 Você pode fechar este modal; o progresso continuará visível no canto inferior direito da tela e o arquivo <code>video_final.mp4</code> será baixado automaticamente ao concluir.
               </div>
@@ -142,6 +156,78 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                 )}
               </div>
 
+              {/* Opções de render (Colab) */}
+              <div
+                style={{
+                  background: 'rgba(15, 23, 42, 0.6)',
+                  border: '1px solid #1e293b',
+                  borderRadius: 8,
+                  padding: '10px 12px',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 8,
+                }}
+              >
+                <div style={{ fontSize: 11, fontWeight: 700, color: '#38bdf8', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                  ⚙️ Opções de render (Colab)
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                  <div>
+                    <label style={{ display: 'block', fontSize: 11, color: 'var(--muted, #94a3b8)', marginBottom: 4 }}>
+                      Formato
+                    </label>
+                    <select
+                      value={formato}
+                      disabled={renderState.isRendering}
+                      onChange={(e) => setFormato(e.target.value as FormatoRender)}
+                      className="input"
+                      style={{
+                        width: '100%',
+                        padding: '6px 8px',
+                        fontSize: 12,
+                        background: '#0b1120',
+                        border: '1px solid #334155',
+                        borderRadius: 6,
+                        color: '#f8fafc',
+                        cursor: renderState.isRendering ? 'not-allowed' : 'pointer',
+                      }}
+                    >
+                      <option value="16:9">16:9 (Horizontal/YouTube)</option>
+                      <option value="9:16">9:16 (Vertical/Shorts/Reels)</option>
+                      <option value="1:1">1:1 (Quadrado/Feed)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label style={{ display: 'block', fontSize: 11, color: 'var(--muted, #94a3b8)', marginBottom: 4 }}>
+                      Qualidade
+                    </label>
+                    <select
+                      value={qualidade}
+                      disabled={renderState.isRendering}
+                      onChange={(e) => setQualidade(e.target.value as QualidadeRender)}
+                      className="input"
+                      style={{
+                        width: '100%',
+                        padding: '6px 8px',
+                        fontSize: 12,
+                        background: '#0b1120',
+                        border: '1px solid #334155',
+                        borderRadius: 6,
+                        color: '#f8fafc',
+                        cursor: renderState.isRendering ? 'not-allowed' : 'pointer',
+                      }}
+                    >
+                      <option value="480p">480p (Rápido / Rascunho)</option>
+                      <option value="720p">720p (HD)</option>
+                      <option value="1080p">1080p (Full HD - Final)</option>
+                    </select>
+                  </div>
+                </div>
+                <p style={{ margin: 0, fontSize: 11, color: '#94a3b8', lineHeight: 1.3 }}>
+                  Use o rápido para conferir cortes e sincronia antes do render final. Estas opções valem só para o render no Colab.
+                </p>
+              </div>
+
               <p style={{ fontSize: 12, color: 'var(--muted)', margin: '0 0 2px' }}>
                 Escolha o método de exportação:
               </p>
@@ -157,7 +243,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                   background: motorOnline ? 'linear-gradient(135deg, #00f0ff 0%, #0284c7 100%)' : undefined,
                 }}
                 disabled={renderState.isRendering}
-                onClick={onRenderColab}
+                onClick={() => onRenderColab({ formato, qualidade })}
               >
                 🚀 Renderizar no Colab (GPU Direto)
               </button>

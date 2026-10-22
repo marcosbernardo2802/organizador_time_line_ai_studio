@@ -30,19 +30,26 @@ export interface ClipItem {
   fadeIn: number;
   fadeOut: number;
   volume: number;
+  score?: number;
 }
 
-export interface JobItem {
+
+export interface EtapaJob {
   id: string;
-  name: string;
-  status: 'fila' | 'processando' | 'concluido' | 'erro';
-  [key: string]: any;
+  nome: string;
+  estado: 'pendente' | 'em_andamento' | 'concluida' | 'erro';
 }
 
 export interface RenderState {
   isRendering: boolean;
   progress: number;
   status: string;
+  // Campos opcionais para progresso real por etapa
+  etapas?: EtapaJob[];
+  detalhe?: string;
+  etapaIndice?: number;
+  etapaTotal?: number;
+  etaSegundos?: number | null;
 }
 
 export interface AiStatus {
@@ -51,6 +58,12 @@ export interface AiStatus {
   pct: number;
   running: boolean;
   error: string;
+  // Campos opcionais para progresso real por etapa
+  etapas?: EtapaJob[];
+  detalhe?: string;
+  etapaIndice?: number;
+  etapaTotal?: number;
+  etaSegundos?: number | null;
 }
 
 export interface AiFiles {
@@ -69,17 +82,3 @@ export interface DragState {
   origClips: ClipItem[];
 }
 
-export interface FolderIds {
-  root?: string;
-  motor?: string;
-  fila?: string;
-  concluido?: string;
-  erro?: string;
-  processando?: string;
-}
-
-export interface UserInfo {
-  email?: string;
-  name?: string;
-  picture?: string;
-}

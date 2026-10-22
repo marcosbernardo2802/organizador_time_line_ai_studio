@@ -1,11 +1,11 @@
 import React from 'react';
 import { AiFiles, AiStatus } from '../../types';
 import { ACCEPT_AUDIO, ACCEPT_VISUAL, isVideoFile } from '../../utils/media';
+import { EtapasProgresso } from '../EtapasProgresso';
 
 interface SendToMotorModalProps {
   isOpen: boolean;
   onClose: () => void;
-  driveReady: boolean;
   motorOnline?: boolean;
   motorGpu?: string;
   onOpenMotorConfig?: () => void;
@@ -14,17 +14,12 @@ interface SendToMotorModalProps {
   aiFiles: AiFiles;
   aiStatus: AiStatus;
   onFileChange: (e: React.ChangeEvent<HTMLInputElement>, type: 'audio' | 'roteiro' | 'images' | 'bgm') => void;
-  onSubmitJob: () => void;
-  onSubmitDirectJob?: () => void;
-  isInIframe?: boolean;
-  onOpenFloatingWindow?: () => void;
-  onOpenOAuthHelp?: () => void;
+  onSubmitDirectJob: () => void;
 }
 
 export const SendToMotorModal: React.FC<SendToMotorModalProps> = ({
   isOpen,
   onClose,
-  driveReady,
   motorOnline = false,
   motorGpu,
   onOpenMotorConfig,
@@ -33,15 +28,9 @@ export const SendToMotorModal: React.FC<SendToMotorModalProps> = ({
   aiFiles,
   aiStatus,
   onFileChange,
-  onSubmitJob,
   onSubmitDirectJob,
-  isInIframe = false,
-  onOpenFloatingWindow,
-  onOpenOAuthHelp,
 }) => {
   if (!isOpen) return null;
-
-  const isReady = motorOnline || driveReady;
 
   return (
     <div className="modal-overlay" onClick={() => !aiStatus.running && onClose()}>
@@ -75,7 +64,7 @@ export const SendToMotorModal: React.FC<SendToMotorModalProps> = ({
                 <div>
                   <strong style={{ color: '#22c55e' }}>Motor Direto Online (Colab GPU)</strong>
                   <div style={{ color: 'var(--muted)', fontSize: 11, marginTop: 1 }}>
-                    {motorGpu ? `GPU: ${motorGpu}` : 'GPU Pronta'} • Sem necessidade de Google Drive
+                    {motorGpu ? `GPU: ${motorGpu}` : 'GPU Pronta'} • Conexão direta via túnel ngrok
                   </div>
                 </div>
               </div>
@@ -126,7 +115,7 @@ export const SendToMotorModal: React.FC<SendToMotorModalProps> = ({
                   }}
                   onClick={onOpenMotorConfig}
                 >
-                  <span>⚡</span> Conectar Motor via ngrok (Recomendado)
+                  <span>⚡</span> Conectar Motor via ngrok
                 </button>
               )}
             </div>
@@ -265,6 +254,13 @@ export const SendToMotorModal: React.FC<SendToMotorModalProps> = ({
               <div className="progress-bar">
                 <div className="progress-fill" style={{ width: `${aiStatus.pct}%` }} />
               </div>
+              <EtapasProgresso
+                etapas={aiStatus.etapas}
+                etapaIndice={aiStatus.etapaIndice}
+                etapaTotal={aiStatus.etapaTotal}
+                detalhe={aiStatus.detalhe}
+                etaSegundos={aiStatus.etaSegundos}
+              />
             </div>
           )}
 
@@ -283,21 +279,19 @@ export const SendToMotorModal: React.FC<SendToMotorModalProps> = ({
               Cancelar
             </button>
             <button
-              className={motorOnline ? 'btn btn-primary' : 'btn btn-gold'}
+              className="btn btn-primary"
               disabled={
-                !isReady ||
+                !motorOnline ||
                 !aiFiles.audio ||
                 !aiFiles.roteiro ||
                 aiFiles.images.length === 0 ||
                 aiStatus.running
               }
-              onClick={motorOnline && onSubmitDirectJob ? onSubmitDirectJob : onSubmitJob}
+              onClick={onSubmitDirectJob}
             >
               {aiStatus.running
                 ? '⟳ Processando...'
-                : motorOnline
-                ? '⚡ Disparar na GPU (ngrok)'
-                : '✦ Enviar ao Motor'}
+                : '⚡ Disparar na GPU (ngrok)'}
             </button>
           </div>
         </div>

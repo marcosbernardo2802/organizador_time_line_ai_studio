@@ -54,11 +54,119 @@ elif "720p" in RESOLUCAO_ESCOLHIDA:
 else:
     RESOLUCAO = (1920, 1080)
 
+# Tabela fixa de perfis de renderização com dimensões pares para compatibilidade yuv420p
+PERFIS_RESOLUCAO = {
+    "16:9": {
+        "480p": (854, 480),
+        "720p": (1280, 720),
+        "1080p": (1920, 1080),
+    },
+    "9:16": {
+        "480p": (480, 854),
+        "720p": (720, 1280),
+        "1080p": (1080, 1920),
+    },
+    "1:1": {
+        "480p": (480, 480),
+        "720p": (720, 720),
+        "1080p": (1080, 1080),
+    },
+}
+
+def resolve_perfil(formato: str = "", qualidade: str = "") -> dict:
+    """
+    Resolve perfil de resolução e preset de codificação com base em whitelist estrita.
+    Preserva a constante global RESOLUCAO e preset fast caso nenhum perfil seja informado.
+    """
+    f = (formato or "").strip()
+    q = (qualidade or "").strip()
+    if not f and not q:
+        return {"resolucao": RESOLUCAO, "preset": "fast", "crf": None}
+
+    if not f:
+        f = "16:9"
+    if not q:
+        q = "1080p"
+
+    if f not in PERFIS_RESOLUCAO or q not in PERFIS_RESOLUCAO[f]:
+        raise ValueError(f"Perfil de render inválido: formato '{formato}', qualidade '{qualidade}'")
+
+    res = PERFIS_RESOLUCAO[f][q]
+    if q == "480p":
+        preset = "veryfast"
+        crf = "28"
+    else:
+        preset = "fast"
+        crf = None
+
+    return {"resolucao": res, "preset": preset, "crf": crf}
+
 MARGEM_EXTRA = 15
+
+# ==============================================================================
+# PLANOS DE ETAPAS E PESOS DE PROGRESSO
+# ==============================================================================
+# Pesos calibráveis com base no tempo real de execução:
+# 1. tipo 'timeline': preparo 3, transcricao 72, sincronizacao 20, finalizacao 5
+# 2. render COM timeline pronta: preparo 3, cortes 82, concatenacao 5, mixagem 10
+# 3. timeline_e_render (ou render sem timeline utilizável): preparo 2, transcricao 25, sincronizacao 5, cortes 55, concatenacao 3, mixagem 8, finalizacao 2
+PLANOS_ETAPAS = {
+    "timeline": [
+        {"id": "preparo", "nome": "Preparando arquivos", "peso": 3, "etapa_legada": "inicio"},
+        {"id": "transcricao", "nome": "Transcrevendo áudio (Whisper)", "peso": 72, "etapa_legada": "whisper"},
+        {"id": "sincronizacao", "nome": "Sincronizando roteiro e cenas", "peso": 20, "etapa_legada": "matching"},
+        {"id": "finalizacao", "nome": "Gerando timeline", "peso": 5, "etapa_legada": "matching"},
+    ],
+    "render_com_timeline": [
+        {"id": "preparo", "nome": "Preparando arquivos", "peso": 3, "etapa_legada": "inicio"},
+        {"id": "cortes", "nome": "Renderizando cenas", "peso": 82, "etapa_legada": "render"},
+        {"id": "concatenacao", "nome": "Unindo cenas", "peso": 5, "etapa_legada": "render"},
+        {"id": "mixagem", "nome": "Mixando áudio e gerando MP4", "peso": 10, "etapa_legada": "render"},
+    ],
+    "timeline_e_render": [
+        {"id": "preparo", "nome": "Preparando arquivos", "peso": 2, "etapa_legada": "inicio"},
+        {"id": "transcricao", "nome": "Transcrevendo áudio (Whisper)", "peso": 25, "etapa_legada": "whisper"},
+        {"id": "sincronizacao", "nome": "Sincronizando roteiro e cenas", "peso": 5, "etapa_legada": "matching"},
+        {"id": "cortes", "nome": "Renderizando cenas", "peso": 55, "etapa_legada": "render"},
+        {"id": "concatenacao", "nome": "Unindo cenas", "peso": 3, "etapa_legada": "render"},
+        {"id": "mixagem", "nome": "Mixando áudio e gerando MP4", "peso": 8, "etapa_legada": "render"},
+        {"id": "finalizacao", "nome": "Gerando timeline", "peso": 2, "etapa_legada": "render"},
+    ],
+}
 
 # Pastas locais temporárias no SSD rápido do Colab (não usam Google Drive)
 PASTA_JOBS = "/content/motor_jobs"
 os.makedirs(PASTA_JOBS, exist_ok=True)
+
+# ==============================================================================
+# KEEP-ALIVE ANTI-DESCONEXÃO DO GOOGLE COLAB
+# ==============================================================================
+_keep_alive_ativo = True
+
+def _keep_alive_loop():
+    """Simula periodicamente interação/clique no Colab para evitar desconexão por inatividade."""
+    while _keep_alive_ativo:
+        time.sleep(4 * 60)
+        if not _keep_alive_ativo:
+            break
+        try:
+            display(Javascript('''
+                (function() {
+                    var btn = document.querySelector("#top-toolbar > colab-connect-button") ||
+                              document.querySelector("colab-connect-button") ||
+                              document.querySelector("#connect");
+                    if (btn) {
+                        btn.click();
+                        console.log("[keep-alive] clique anti-inatividade executado: " + new Date().toLocaleTimeString());
+                    }
+                })();
+            '''))
+        except Exception:
+            pass
+
+_thread_keep_alive = threading.Thread(target=_keep_alive_loop, daemon=True)
+_thread_keep_alive.start()
+print("🟢 Keep-alive anti-desconexão ativado (pulsos a cada 4 min)")
 
 
 # ==============================================================================
@@ -104,6 +212,12 @@ def eh_imagem(filename: str) -> bool:
 def eh_visual(filename: str) -> bool:
     return get_ext(filename) in EXTENSOES_VISUAIS
 
+ARQUIVOS_IGNORADOS = {
+    'audio', 'bgm', 'narration', 'narracao', 'voz', 'trilha', 'music', 'musica',
+    'video_final', 'video_sem_audio', 'saida', 'output', 'export', 'temp', 'preview',
+    'status', 'timeline', 'roteiro', 'sub_concat', 'concat'
+}
+
 def obtem_unidades_visuais(pasta: str):
     """
     Agrupa os arquivos visuais da pasta por nome base (sem extensão).
@@ -129,8 +243,11 @@ def obtem_unidades_visuais(pasta: str):
     for f in arquivos:
         if not eh_visual(f) or eh_audio(f):
             continue
-        # Ignora arquivos ocultos ou arquivos de áudio/música
-        if f.startswith('.') or nome_base_sem_ext(f).lower() in ['audio', 'bgm', 'narration']:
+        # Ignora arquivos ocultos, arquivos de áudio ou arquivos gerados/auxiliares
+        base_limpa = nome_base_sem_ext(f).lower()
+        if f.startswith('.') or f.startswith('_') or base_limpa in ARQUIVOS_IGNORADOS:
+            continue
+        if any(ign in base_limpa for ign in ['video_final', 'video_sem_audio', 'output_final', 'sub_concat', 'concat']):
             continue
 
         base = nome_base_sem_ext(f).lower()
@@ -174,30 +291,124 @@ def obtem_unidades_visuais(pasta: str):
 # ==============================================================================
 # 3. NÚCLEO DE IA — WHISPER E MATCHING
 # ==============================================================================
+_whisper_lock = threading.Lock()
 _whisper_cache = None
 
 def get_whisper():
     global _whisper_cache
-    if _whisper_cache is None:
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"🧠 Carregando Whisper ({WHISPER_MODEL}) no dispositivo [{device.upper()}]...")
-        _whisper_cache = whisper.load_model(WHISPER_MODEL, device=device)
+    with _whisper_lock:
+        if _whisper_cache is None:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"🧠 Carregando Whisper ({WHISPER_MODEL}) no dispositivo [{device.upper()}]...")
+            _whisper_cache = whisper.load_model(WHISPER_MODEL, device=device)
     return _whisper_cache
 
 def transcreve_audio(audio_path: str, cb_status=None):
-    if cb_status: cb_status("whisper", "Transcrevendo áudio com Whisper na GPU...", 15)
-    model = get_whisper()
-    result = model.transcribe(audio_path, word_timestamps=True, language="pt")
-    palavras = []
-    for seg in result['segments']:
-        for w in seg.get('words', []):
-            palavras.append({
-                "word":  w['word'].strip(),
-                "start": w['start'],
-                "end":   w['end'],
-            })
-    duracao = result['segments'][-1]['end'] if result['segments'] else 0
-    return palavras, duracao
+    with _whisper_lock:
+        is_progresso = hasattr(cb_status, "inicia_etapa")
+        global _whisper_cache
+
+        # Se o modelo ainda não estiver carregado na VRAM, sinaliza no detalhe
+        if _whisper_cache is None:
+            if is_progresso:
+                cb_status.inicia_etapa("transcricao", detalhe="Carregando modelo Whisper...")
+            elif cb_status:
+                cb_status("whisper", "Carregando modelo Whisper...", 15)
+            model = get_whisper()
+        else:
+            model = _whisper_cache
+            if is_progresso:
+                cb_status.inicia_etapa("transcricao", detalhe="Iniciando transcrição na GPU...")
+            elif cb_status:
+                cb_status("whisper", "Transcrevendo áudio com Whisper na GPU...", 15)
+
+        # Gancho dinâmico no tqdm para capturar progresso real de frames do Whisper
+        hook_instalado = False
+        orig_tqdm = None
+        tqdm_module = None
+        tqdm_attr_name = 'tqdm'
+
+        try:
+            # Tenta interceptar o tqdm usado internamente pelo openai-whisper
+            import whisper.transcribe as wt_mod
+            if hasattr(wt_mod, 'tqdm'):
+                attr = getattr(wt_mod, 'tqdm')
+                if isinstance(attr, type):
+                    orig_tqdm = attr
+                    tqdm_module = wt_mod
+                elif hasattr(attr, 'tqdm'):
+                    orig_tqdm = attr.tqdm
+                    tqdm_module = attr
+        except Exception:
+            pass
+
+        if orig_tqdm is None:
+            try:
+                import tqdm
+                orig_tqdm = tqdm.tqdm
+                tqdm_module = tqdm
+            except Exception:
+                pass
+
+        if orig_tqdm is not None and tqdm_module is not None:
+            try:
+                class WhisperHookedTqdm(orig_tqdm):
+                    def __init__(self, *args, **kwargs):
+                        super().__init__(*args, **kwargs)
+                        self._w_total = kwargs.get('total')
+                        self._w_unit = kwargs.get('unit')
+
+                    def update(self, n=1):
+                        res = super().update(n)
+                        try:
+                            if getattr(self, '_w_unit', None) == 'frames' and getattr(self, '_w_total', None):
+                                if self._w_total > 0 and is_progresso:
+                                    frac = min(1.0, max(0.0, float(self.n) / float(self._w_total)))
+                                    cb_status.fracao(frac, f"Transcrevendo... {int(round(frac * 100))}%")
+                        except Exception:
+                            pass
+                        return res
+
+                setattr(tqdm_module, tqdm_attr_name, WhisperHookedTqdm)
+                hook_instalado = True
+            except Exception as e:
+                print(f"⚠️ Aviso ao instalar gancho tqdm no Whisper: {e}")
+
+        # Plano B: Thread temporizadora que atualiza apenas o detalhe a cada 20s (sem inventar percentual)
+        stop_timer = threading.Event()
+        def timer_plano_b():
+            t0 = time.time()
+            while not stop_timer.wait(20):
+                elapsed = time.time() - t0
+                mins = int(elapsed // 60)
+                txt = f"Transcrevendo... {mins} min decorridos" if mins > 0 else f"Transcrevendo... {int(elapsed)}s decorridos"
+                if is_progresso and not getattr(cb_status, "teve_fracao_recente", lambda: False)():
+                    cb_status.atualiza_detalhe(txt)
+
+        t_timer = threading.Thread(target=timer_plano_b, daemon=True)
+        t_timer.start()
+
+        try:
+            # verbose=False no Whisper ativa o tqdm interno com unit='frames'
+            result = model.transcribe(audio_path, word_timestamps=True, language="pt", verbose=False)
+        finally:
+            stop_timer.set()
+            if hook_instalado and orig_tqdm is not None and tqdm_module is not None:
+                try:
+                    setattr(tqdm_module, tqdm_attr_name, orig_tqdm)
+                except Exception:
+                    pass
+
+        palavras = []
+        for seg in result['segments']:
+            for w in seg.get('words', []):
+                palavras.append({
+                    "word":  w['word'].strip(),
+                    "start": w['start'],
+                    "end":   w['end'],
+                })
+        duracao = result['segments'][-1]['end'] if result['segments'] else 0
+        return palavras, duracao
 
 def normaliza_texto(texto: str):
     texto = texto.lower()
@@ -207,12 +418,17 @@ def normaliza_texto(texto: str):
     return texto.split()
 
 def le_roteiro_conteudo(conteudo: str, total_midias: int = 0):
-    partes = re.split(r'\[(?:cena|bloco)\s*(\d+)\]', conteudo, flags=re.IGNORECASE)
+    # Regex robusto para capturar [CENA0001], [CENA 1], [CENA_0001], [BLOCO 1], [0001], CENA 0001:, etc.
+    padrao = r'(?:^|\n)\s*\[?\s*(?:cena|bloco)?\s*[_:\-]?\s*(\d+)\s*\]?\s*[:\-]?\s*(?:\n|$)'
+    partes = re.split(padrao, '\n' + conteudo, flags=re.IGNORECASE)
     blocos = []
     for i in range(1, len(partes), 2):
         txt = partes[i+1].strip() if i+1 < len(partes) else ''
         if txt:
-            blocos.append({"num": int(partes[i]), "texto": txt})
+            # Remove anotações residuais visuais/técnicas que não fazem parte da locução
+            txt_limpo = re.sub(r'\[(?:visual|efeito|audio|camera|b-roll)[^\]]*\]', '', txt, flags=re.IGNORECASE).strip()
+            num_val = int(partes[i])
+            blocos.append({"num": num_val, "id_cena": f"{num_val:04d}", "texto": txt_limpo or txt})
 
     if not blocos and conteudo.strip():
         linhas = [p.strip() for p in conteudo.split('\n') if p.strip()]
@@ -220,70 +436,131 @@ def le_roteiro_conteudo(conteudo: str, total_midias: int = 0):
             chunk = max(1, len(linhas) // total_midias)
             for idx in range(total_midias):
                 sub_txt = " ".join(linhas[idx*chunk : (idx+1)*chunk]) if idx < total_midias - 1 else " ".join(linhas[idx*chunk:])
-                blocos.append({"num": idx + 1, "texto": sub_txt or f"Cena {idx+1}"})
+                num_val = idx + 1
+                blocos.append({"num": num_val, "id_cena": f"{num_val:04d}", "texto": sub_txt or f"Cena {num_val}"})
         else:
             for idx, lin in enumerate(linhas):
-                blocos.append({"num": idx + 1, "texto": lin})
+                num_val = idx + 1
+                blocos.append({"num": num_val, "id_cena": f"{num_val:04d}", "texto": lin})
     return blocos
 
 def mapeia_timeline(palavras, duracao_audio, blocos, cb_status=None):
-    if cb_status: cb_status("matching", "Mapeando sincronia das cenas...", 35)
+    is_progresso = hasattr(cb_status, "inicia_etapa")
+    total_blocos = len(blocos) if blocos else 1
+
+    if is_progresso:
+        cb_status.inicia_etapa("sincronizacao", detalhe=f"Bloco 1 de {total_blocos}")
+    elif cb_status:
+        cb_status("matching", "Mapeando sincronia exata das cenas com Whisper...", 35)
+
+    if not blocos:
+        return []
+
+    if not palavras or duracao_audio <= 0:
+        dur_por_cena = duracao_audio / max(len(blocos), 1)
+        instrucoes = []
+        for i, b in enumerate(blocos):
+            t_ini = round(i * dur_por_cena, 3)
+            t_fim = round((i + 1) * dur_por_cena, 3) if i < len(blocos) - 1 else round(duracao_audio, 3)
+            instrucoes.append({
+                "id_cena":    b.get("id_cena", f"{b['num']:04d}"),
+                "start":      t_ini,
+                "end":        t_fim,
+                "duration":   round(max(0.1, t_fim - t_ini), 3),
+                "score":      0.5,
+                "effect":     "none",
+                "transition": "none",
+            })
+        return instrucoes
 
     whisper_norm = []
     for w in palavras:
         tok = normaliza_texto(w['word'])
         whisper_norm.append(tok[0] if tok else '')
 
+    n_palavras = len(whisper_norm)
     total_rot = sum(len(normaliza_texto(b['texto'])) for b in blocos)
-    escala = len(palavras) / max(total_rot, 1)
+    escala = n_palavras / max(total_rot, 1)
 
-    def acha_fim(bloco_norm, ponteiro, janela_max, n_ancora=5):
-        ancora = bloco_norm[-n_ancora:] if len(bloco_norm) >= n_ancora else bloco_norm
-        n = len(ancora)
-        limite = min(ponteiro + janela_max, len(whisper_norm) - n)
-        melhor_score, melhor_idx = -1, ponteiro
-        for j in range(ponteiro, max(ponteiro, limite + 1)):
-            score = SequenceMatcher(None, ancora, whisper_norm[j:j+n]).ratio()
-            if score > melhor_score:
-                melhor_score, melhor_idx = score, j + n - 1
-        return melhor_idx, melhor_score
+    # Função que encontra a transição contígua exata entre Cena i e Cena i+1
+    # Prioriza o início da fala da próxima cena com confirmação do fim da cena atual
+    def encontra_corte_entre_cenas(bloco_atual, bloco_prox, ptr_min, ptr_max):
+        prox_words = normaliza_texto(bloco_prox['texto'])
+        ancora_ini = prox_words[:min(5, len(prox_words))]
+        n_ini = len(ancora_ini)
+
+        atual_words = normaliza_texto(bloco_atual['texto'])
+        ancora_fim = atual_words[-min(4, len(atual_words)):] if len(atual_words) >= 4 else atual_words
+        n_fim = len(ancora_fim)
+
+        melhor_idx_corte = -1
+        melhor_score = -1.0
+
+        limite = min(ptr_max, n_palavras - max(n_ini, 1))
+        for j in range(ptr_min, max(ptr_min + 1, limite + 1)):
+            sub_ini = whisper_norm[j : j + n_ini]
+            score_ini = SequenceMatcher(None, ancora_ini, sub_ini).ratio() if n_ini > 0 else 0.0
+
+            score_fim = 0.0
+            if j >= n_fim and n_fim > 0:
+                sub_fim = whisper_norm[j - n_fim : j]
+                score_fim = SequenceMatcher(None, ancora_fim, sub_fim).ratio()
+
+            score_total = (score_ini * 0.75) + (score_fim * 0.25) if score_fim > 0 else score_ini
+            if score_total > melhor_score:
+                melhor_score = score_total
+                melhor_idx_corte = j
+
+        if melhor_score < 0.35:
+            len_atual = len(normaliza_texto(bloco_atual['texto']))
+            melhor_idx_corte = min(ptr_min + max(1, int(len_atual * escala)), n_palavras - 1)
+            melhor_score = 0.35
+
+        return melhor_idx_corte, melhor_score
+
+    # Calcula os pontos de corte contíguos sem nenhum gap ou tela preta entre cenas
+    pontos_corte = [0.0]
+    scores = []
+    ptr = 0
+
+    for i in range(len(blocos) - 1):
+        bloco_atual = blocos[i]
+        bloco_prox = blocos[i+1]
+
+        len_atual = len(normaliza_texto(bloco_atual['texto']))
+        ptr_min = max(0, ptr + max(1, int(len_atual * escala * 0.4)))
+        ptr_max = min(n_palavras, ptr + int(len_atual * escala * 1.6) + MARGEM_EXTRA + 10)
+
+        idx_corte, score = encontra_corte_entre_cenas(bloco_atual, bloco_prox, ptr_min, ptr_max)
+        t_corte = palavras[idx_corte]['start'] if idx_corte < len(palavras) else duracao_audio
+        t_corte = max(t_corte, pontos_corte[-1] + 0.3)
+        pontos_corte.append(round(t_corte, 3))
+        scores.append(round(score, 2))
+        ptr = max(ptr + 1, idx_corte)
+
+        if is_progresso:
+            cb_status.fracao((i + 1) / float(total_blocos), f"Bloco {i + 1} de {total_blocos}")
+
+    pontos_corte.append(round(duracao_audio, 3))
+    scores.append(1.0)
+    if is_progresso:
+        cb_status.fracao(1.0, f"Bloco {total_blocos} de {total_blocos}")
 
     instrucoes = []
-    ponteiro = 0
-
-    for i, bloco in enumerate(blocos):
-        bloco_norm = normaliza_texto(bloco['texto'])
-        if not bloco_norm:
-            continue
-        janela_max = int(len(bloco_norm) * escala) + MARGEM_EXTRA
-        idx_fim, score = acha_fim(bloco_norm, ponteiro, janela_max)
-
-        if score < 0.35:
-            idx_fim = min(ponteiro + int(len(bloco_norm) * escala), len(palavras) - 1)
-
-        t_start = palavras[ponteiro]['start'] if ponteiro < len(palavras) else duracao_audio
-        if i == 0:
-            t_start = 0.0
-
-        t_end = palavras[idx_fim]['end'] if idx_fim < len(palavras) else duracao_audio
-        if i > 0 and instrucoes:
-            t_start = max(t_start, instrucoes[-1]['end'])
-        t_end = max(t_end, t_start + 0.3)
+    for i in range(len(blocos)):
+        t_ini = pontos_corte[i]
+        t_fim = pontos_corte[i+1]
+        dur = round(max(0.1, t_fim - t_ini), 3)
 
         instrucoes.append({
-            "id_cena":    f"{bloco['num']:04d}",
-            "start":      round(t_start, 3),
-            "end":        round(t_end, 3),
-            "duration":   round(t_end - t_start, 3),
-            "score":      round(score, 2),
+            "id_cena":    blocos[i].get("id_cena", f"{blocos[i]['num']:04d}"),
+            "start":      round(t_ini, 3),
+            "end":        round(t_fim, 3),
+            "duration":   dur,
+            "score":      scores[i] if i < len(scores) else 0.9,
             "effect":     "none",
             "transition": "none",
         })
-        ponteiro = idx_fim + 1
-
-    if instrucoes:
-        instrucoes[-1]['end'] = duracao_audio
-        instrucoes[-1]['duration'] = round(duracao_audio - instrucoes[-1]['start'], 3)
 
     return instrucoes
 
@@ -292,9 +569,23 @@ def mapeia_timeline(palavras, duracao_audio, blocos, cb_status=None):
 # 4. RENDERIZADOR FFMPEG
 # ==============================================================================
 def obtem_duracao_midia(path: str) -> float:
-    """Obtém a duração exata de um arquivo de vídeo ou áudio em segundos via ffprobe."""
+    """Obtém a duração exata do stream de vídeo/áudio via ffprobe."""
     if not path or not os.path.exists(path):
         return 0.0
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            path
+        ]
+        out = subprocess.check_output(cmd, text=True).strip()
+        if out and out != 'N/A':
+            val = float(out)
+            if val > 0.05: return val
+    except Exception:
+        pass
     try:
         cmd = [
             'ffprobe', '-v', 'error',
@@ -313,35 +604,55 @@ def obtem_duracao_midia(path: str) -> float:
         except Exception:
             return 0.0
 
-def renderiza_trecho_visual(src, dur, dst_path, fit='contain', efeito='none', filtro='none', filtro_int=100, transicao='none', trans_dur=0.8, slow_factor=1.0):
+def video_tem_audio(path: str) -> bool:
+    """Verifica se o arquivo de vídeo possui uma faixa de áudio válida."""
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'a:0',
+            '-show_entries', 'stream=codec_type',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            path
+        ]
+        out = subprocess.check_output(cmd, text=True).strip()
+        return bool(out and 'audio' in out.lower())
+    except Exception:
+        return False
+
+def renderiza_trecho_visual(src, dur, dst_path, fit='contain', efeito='none', filtro='none', filtro_int=100, transicao='none', trans_dur=0.8, slow_factor=1.0, volume=0.0, resolucao=RESOLUCAO, preset="fast", crf=None):
     """
     Renderiza um trecho visual individual (vídeo ou imagem) com FFmpeg padronizado na resolução final.
-    Suporta escala, slow motion suave via setpts, efeitos de câmera e filtros.
+    Suporta escala, slow motion suave via setpts, efeitos de câmera, filtros e áudio sincronizado com volume individual.
     """
     is_vid = eh_video(src)
     vf_parts = []
 
-    # 1. Ajuste de escala e proporção (contain / cover)
-    if fit == 'cover':
-        vf_parts.append(f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=increase,crop={RESOLUCAO[0]}:{RESOLUCAO[1]}")
-    else:
-        vf_parts.append(f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=decrease,pad={RESOLUCAO[0]}:{RESOLUCAO[1]}:(ow-iw)/2:(oh-ih)/2:black")
+    # 1. Normalização de PTS (evita offsets de tempo herdados do container/codec do vídeo original)
+    if is_vid:
+        if slow_factor > 1.001:
+            vf_parts.append(f"setpts=(PTS-STARTPTS)*{slow_factor:.5f}")
+        else:
+            vf_parts.append("setpts=PTS-STARTPTS")
 
-    # 2. Desaceleração de velocidade (slow-motion) se especificado
-    if is_vid and slow_factor > 1.001:
-        vf_parts.append(f"setpts={slow_factor:.5f}*PTS")
+    # 2. Ajuste de escala e proporção (contain / cover) conforme resolução configurada
+    if fit == 'cover':
+        vf_parts.append(f"scale={resolucao[0]}:{resolucao[1]}:force_original_aspect_ratio=increase,crop={resolucao[0]}:{resolucao[1]}")
+    else:
+        vf_parts.append(f"scale={resolucao[0]}:{resolucao[1]}:force_original_aspect_ratio=decrease,pad={resolucao[0]}:{resolucao[1]}:(ow-iw)/2:(oh-ih)/2:black")
 
     # 3. Efeitos de movimento de câmera em imagens
     if not is_vid:
         nb_frames = max(1, int(dur * FPS))
         if efeito in ('kenburns', 'zoom_in'):
-            vf_parts.append(f"zoompan=z='min(zoom+0.0008,1.1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={FPS}")
+            vf_parts.append(f"zoompan=z='min(zoom+0.0008,1.1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={resolucao[0]}x{resolucao[1]}:fps={FPS}")
         elif efeito == 'zoom_out':
-            vf_parts.append(f"zoompan=z='if(eq(on\\,1)\\,1.1\\,max(zoom-0.0008\\,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={FPS}")
+            vf_parts.append(f"zoompan=z='if(eq(on\\,1)\\,1.1\\,max(zoom-0.0008\\,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={resolucao[0]}x{resolucao[1]}:fps={FPS}")
         elif efeito == 'pan_right':
-            vf_parts.append(f"zoompan=z=1.1:x='if(eq(on\\,1)\\,0\\,x+0.5)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={FPS}")
+            vf_parts.append(f"zoompan=z=1.1:x='if(eq(on\\,1)\\,0\\,x+0.5)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={resolucao[0]}x{resolucao[1]}:fps={FPS}")
         elif efeito == 'pan_left':
-            vf_parts.append(f"zoompan=z=1.1:x='if(eq(on\\,1)\\,iw*0.1-iw/zoom/2\\,x-0.5)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={RESOLUCAO[0]}x{RESOLUCAO[1]}:fps={FPS}")
+            vf_parts.append(f"zoompan=z=1.1:x='if(eq(on\\,1)\\,iw*0.1-iw/zoom/2\\,x-0.5)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={resolucao[0]}x{resolucao[1]}:fps={FPS}")
 
     # 4. Filtros de cor
     intensidade = filtro_int / 100.0
@@ -365,39 +676,54 @@ def renderiza_trecho_visual(src, dur, dst_path, fit='contain', efeito='none', fi
     vf_parts.append(f"fps={FPS}")
     vf_chain = ",".join(vf_parts)
 
-    cmd = ['ffmpeg', '-y']
-    if is_vid:
-        cmd.extend(['-stream_loop', '-1'])
+    tem_som_valido = is_vid and (float(volume) > 0.001) and video_tem_audio(src)
+
+    # Argumentos de codificação libx264 com preset e crf configurados
+    args_video = ['-c:v', 'libx264', '-preset', preset]
+    if crf:
+        args_video.extend(['-crf', str(crf)])
+
+    if tem_som_valido:
+        af_parts = []
+        if slow_factor > 1.001:
+            af_parts.append(f"atempo={max(0.5, 1.0/slow_factor):.5f}")
+        af_parts.append(f"volume={float(volume):.2f}")
+        af_chain = ",".join(af_parts)
+
+        cmd = [
+            'ffmpeg', '-y', '-i', src, '-t', str(dur),
+            '-vf', vf_chain, '-af', af_chain,
+            *args_video, '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-ar', '48000', '-ac', '2',
+            '-video_track_timescale', '90000',
+            dst_path
+        ]
     else:
-        cmd.extend(['-loop', '1'])
-
-    cmd.extend([
-        '-i', src, '-t', str(dur),
-        '-vf', vf_chain,
-        '-c:v', 'libx264', '-preset', 'fast',
-        '-pix_fmt', 'yuv420p',
-        '-video_track_timescale', '90000',
-        '-an', dst_path
-    ])
-    res = subprocess.run(cmd, capture_output=True)
-
-    if res.returncode != 0:
-        # Fallback simples em caso de erro nos filtros complexos
-        cmd_fallback = ['ffmpeg', '-y']
-        if is_vid: cmd_fallback.extend(['-stream_loop', '-1'])
-        else: cmd_fallback.extend(['-loop', '1'])
-        vf_simple = f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=decrease,pad={RESOLUCAO[0]}:{RESOLUCAO[1]}:(ow-iw)/2:(oh-ih)/2:black,fps={FPS}"
-        cmd_fallback.extend([
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
             '-i', src, '-t', str(dur),
-            '-vf', vf_simple,
-            '-c:v', 'libx264', '-preset', 'fast',
-            '-pix_fmt', 'yuv420p', '-video_track_timescale', '90000', '-an', dst_path
-        ])
-        subprocess.run(cmd_fallback, capture_output=True)
+            '-vf', vf_chain,
+            *args_video, '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-ar', '48000', '-ac', '2',
+            '-map', '1:v:0', '-map', '0:a:0',
+            '-video_track_timescale', '90000',
+            dst_path
+        ]
+    subprocess.run(cmd, capture_output=True)
 
-def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4, cb_status=None):
-    if cb_status: cb_status("render", "Gerando cortes e analisando vídeos/imagens na GPU...", 60)
+def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4, cb_status=None, resolucao=RESOLUCAO, preset="fast", crf=None, formato="", qualidade=""):
+    is_progresso = hasattr(cb_status, "inicia_etapa")
+    total_cenas = len(instrucoes) if instrucoes else 1
+
+    if is_progresso:
+        cb_status.inicia_etapa("cortes", detalhe=f"Cena 1 de {total_cenas}")
+    elif cb_status:
+        msg_status = f"Renderizando {formato} em {qualidade} (gerando cortes na GPU)..." if (formato and qualidade) else "Gerando cortes e analisando vídeos/imagens na GPU..."
+        cb_status("render", msg_status, 60)
+
     tmp_dir = tempfile.mkdtemp(prefix='motor_render_')
+    t_inicio_etapa_cortes = time.time()
     
     try:
         clips_processados = []
@@ -427,29 +753,29 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
             unidade_escolhida = None
 
             # 1. Correspondência com arquivo declarado ou base_decl
+            id_digits = re.sub(r'\D', '', id_str).lstrip('0') or '0'
             for u in unidades_visuais:
                 b = u['base']
                 b_clean = b.lstrip('0') or '0'
+                b_digits = re.sub(r'\D', '', b).lstrip('0') or '0'
                 if (arquivo and (arquivo.lower() == (u['video'] or '').lower() or arquivo.lower() == (u['imagem'] or '').lower())) \
-                   or b == base_decl or b_clean == base_decl_clean:
+                   or b == base_decl or b_clean == base_decl_clean or (b_digits and b_digits == id_digits):
                     unidade_escolhida = u
                     break
 
-            # 2. Se não achou, correspondência por ID da cena
+            # 2. Se não achou, correspondência por ID da cena ou dígitos
             if not unidade_escolhida:
                 for u in unidades_visuais:
                     b = u['base']
                     b_clean = b.lstrip('0') or '0'
-                    if b == id_str or b_clean == id_clean or id_str in b or (id_clean and id_clean in b):
+                    b_digits = re.sub(r'\D', '', b).lstrip('0') or '0'
+                    if b == id_str or b_clean == id_clean or (b_digits and b_digits == id_digits) or id_str in b or b in id_str:
                         unidade_escolhida = u
                         break
 
-            # 3. Fallback sequencial por índice sobre UNIDADES (nunca pega imagens complementares avulsas!)
-            if not unidade_escolhida:
-                if i < len(unidades_visuais):
-                    unidade_escolhida = unidades_visuais[i]
-                elif unidades_visuais:
-                    unidade_escolhida = unidades_visuais[i % len(unidades_visuais)]
+            # 3. Fallback sequencial por índice sobre UNIDADES (sem ciclar com % para nunca duplicar 0001.mp4!)
+            if not unidade_escolhida and i < len(unidades_visuais):
+                unidade_escolhida = unidades_visuais[i]
 
             video_src = unidade_escolhida['video_path'] if unidade_escolhida else None
             image_src = unidade_escolhida['image_path'] if unidade_escolhida else None
@@ -470,6 +796,7 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
             filtro_int = int(cena.get('filter_intensity', 100))
             transicao  = cena.get('transition', 'none')
             trans_dur  = float(cena.get('transition_duration', 0.8))
+            volume     = float(cena.get('volume', 0.0))
 
             # ==================================================================
             # REGRAS DE DECISÃO VÍDEO vs IMAGEM (PREFERÊNCIA PARA O VÍDEO):
@@ -482,11 +809,12 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                 # -> O vídeo deve ser CORTADO para encaixar na cena
                 # --------------------------------------------------------------
                 if dur_real <= dur_vid:
-                    print(f"      🎬 Cena {i+1} ({id_cena}): Vídeo ({dur_vid:.2f}s) CORTADO para encaixar na cena ({dur_real:.2f}s)")
+                    print(f"      🎬 Cena {i+1} ({id_cena}): Vídeo ({dur_vid:.2f}s) CORTADO para encaixar na cena ({dur_real:.2f}s) | Vol: {int(volume*100)}%")
                     renderiza_trecho_visual(
                         src=video_src, dur=dur_real, dst_path=dst,
                         fit=fit, efeito=efeito, filtro=filtro, filtro_int=filtro_int,
-                        transicao=transicao, trans_dur=trans_dur, slow_factor=1.0
+                        transicao=transicao, trans_dur=trans_dur, slow_factor=1.0,
+                        volume=volume, resolucao=resolucao, preset=preset, crf=crf
                     )
 
                 # --------------------------------------------------------------
@@ -495,11 +823,12 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                 # --------------------------------------------------------------
                 elif dur_real <= (dur_vid * 1.40):
                     fator_slow = dur_real / dur_vid
-                    print(f"      🎬 Cena {i+1} ({id_cena}): Vídeo ({dur_vid:.2f}s) DESACELERADO ({fator_slow:.2f}x) para preencher a cena ({dur_real:.2f}s)")
+                    print(f"      🎬 Cena {i+1} ({id_cena}): Vídeo ({dur_vid:.2f}s) DESACELERADO ({fator_slow:.2f}x) para preencher a cena ({dur_real:.2f}s) | Vol: {int(volume*100)}%")
                     renderiza_trecho_visual(
                         src=video_src, dur=dur_real, dst_path=dst,
                         fit=fit, efeito=efeito, filtro=filtro, filtro_int=filtro_int,
-                        transicao=transicao, trans_dur=trans_dur, slow_factor=fator_slow
+                        transicao=transicao, trans_dur=trans_dur, slow_factor=fator_slow,
+                        volume=volume, resolucao=resolucao, preset=preset, crf=crf
                     )
 
                 # --------------------------------------------------------------
@@ -507,72 +836,142 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                 # -> Começa com o VÍDEO em velocidade normal e COMPLETA com a IMAGEM de mesmo nome
                 # --------------------------------------------------------------
                 else:
-                    dur_parte_video = dur_vid
-                    dur_parte_imagem = max(0.1, round(dur_real - dur_vid, 3))
-                    print(f"      🎬 Cena {i+1} ({id_cena}): Cena ({dur_real:.2f}s) > 140% do vídeo ({dur_vid:.2f}s) -> Vídeo ({dur_parte_video:.2f}s) + Imagem ({dur_parte_imagem:.2f}s)")
+                    if image_src:
+                        dur_parte_video = dur_vid
+                        dur_parte_imagem = max(0.1, round(dur_real - dur_vid, 3))
+                        print(f"      🎬 Cena {i+1} ({id_cena}): Cena ({dur_real:.2f}s) > 140% do vídeo ({dur_vid:.2f}s) -> Vídeo ({dur_parte_video:.2f}s) + Imagem ({dur_parte_imagem:.2f}s) | Vol: {int(volume*100)}%")
 
-                    p1 = os.path.join(tmp_dir, f"cena_{i:04d}_p1.mp4")
-                    p2 = os.path.join(tmp_dir, f"cena_{i:04d}_p2.mp4")
+                        p1 = os.path.join(tmp_dir, f"cena_{i:04d}_p1.mp4")
+                        p2 = os.path.join(tmp_dir, f"cena_{i:04d}_p2.mp4")
 
-                    # 1. Vídeo inicial na sua velocidade natural
-                    renderiza_trecho_visual(
-                        src=video_src, dur=dur_parte_video, dst_path=p1,
-                        fit=fit, efeito='none', filtro=filtro, filtro_int=filtro_int,
-                        transicao=transicao, trans_dur=trans_dur, slow_factor=1.0
-                    )
+                        # 1. Vídeo inicial na sua velocidade natural com volume configurado
+                        renderiza_trecho_visual(
+                            src=video_src, dur=dur_parte_video, dst_path=p1,
+                            fit=fit, efeito='none', filtro=filtro, filtro_int=filtro_int,
+                            transicao=transicao, trans_dur=trans_dur, slow_factor=1.0,
+                            volume=volume, resolucao=resolucao, preset=preset, crf=crf
+                        )
 
-                    # 2. Imagem de mesmo nome completando o restante do tempo
-                    src_segunda_parte = image_src if image_src else video_src
-                    renderiza_trecho_visual(
-                        src=src_segunda_parte, dur=dur_parte_imagem, dst_path=p2,
-                        fit=fit, efeito=efeito, filtro=filtro, filtro_int=filtro_int,
-                        transicao='none', trans_dur=trans_dur, slow_factor=1.0
-                    )
+                        # 2. Imagem companheira completando o restante do tempo (com faixa de áudio silenciosa padronizada)
+                        renderiza_trecho_visual(
+                            src=image_src, dur=dur_parte_imagem, dst_path=p2,
+                            fit=fit, efeito=efeito, filtro=filtro, filtro_int=filtro_int,
+                            transicao='none', trans_dur=trans_dur, slow_factor=1.0,
+                            volume=0.0, resolucao=resolucao, preset=preset, crf=crf
+                        )
 
-                    # 3. Concatenação perfeita dos dois trechos
-                    sub_concat = os.path.join(tmp_dir, f"sub_concat_{i:04d}.txt")
-                    with open(sub_concat, 'w', encoding='utf-8') as f:
-                        f.write(f"file '{p1}'\n")
-                        f.write(f"file '{p2}'\n")
+                        # 3. Concatenação perfeita com filter_complex (áudio e vídeo em sincronia precisa)
+                        cmd_concat = [
+                            'ffmpeg', '-y',
+                            '-i', p1, '-i', p2,
+                            '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0[v];[0:a][1:a]concat=n=2:v=0:a=1[a]',
+                            '-map', '[v]', '-map', '[a]',
+                            '-c:v', 'libx264', '-preset', preset,
+                        ]
+                        if crf:
+                            cmd_concat.extend(['-crf', str(crf)])
+                        cmd_concat.extend([
+                            '-pix_fmt', 'yuv420p', '-r', str(FPS),
+                            '-c:a', 'aac', '-ar', '48000', '-ac', '2',
+                            dst
+                        ])
+                        subprocess.run(cmd_concat, capture_output=True)
+                    else:
+                        # Sem imagem companheira: reproduz o vídeo e congela no último frame para preencher o tempo da fala
+                        print(f"      🎬 Cena {i+1} ({id_cena}): Vídeo ({dur_vid:.2f}s) estendido com freeze do último frame para preencher ({dur_real:.2f}s) | Vol: {int(volume*100)}%")
+                        dur_freeze = max(0.1, round(dur_real - dur_vid, 3))
+                        vf_freeze = f"setpts=PTS-STARTPTS,scale={resolucao[0]}:{resolucao[1]}:force_original_aspect_ratio=decrease,pad={resolucao[0]}:{resolucao[1]}:(ow-iw)/2:(oh-ih)/2:black,tpad=stop_mode=clone:stop_duration={dur_freeze:.3f},fps={FPS}"
+                        tem_som_valido = (volume > 0.001) and video_tem_audio(video_src)
+                        args_freeze = ['-c:v', 'libx264', '-preset', preset]
+                        if crf:
+                            args_freeze.extend(['-crf', str(crf)])
 
-                    subprocess.run([
-                        'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
-                        '-i', sub_concat, '-c', 'copy', '-fflags', '+genpts', dst
-                    ], capture_output=True)
+                        if tem_som_valido:
+                            cmd_freeze = [
+                                'ffmpeg', '-y', '-i', video_src, '-t', str(dur_real),
+                                '-vf', vf_freeze,
+                                '-af', f"volume={volume:.2f},apad=pad_dur={dur_freeze:.3f}",
+                                *args_freeze,
+                                '-pix_fmt', 'yuv420p',
+                                '-c:a', 'aac', '-ar', '48000', '-ac', '2',
+                                dst
+                            ]
+                        else:
+                            cmd_freeze = [
+                                'ffmpeg', '-y',
+                                '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
+                                '-i', video_src, '-t', str(dur_real),
+                                '-vf', vf_freeze,
+                                *args_freeze,
+                                '-pix_fmt', 'yuv420p',
+                                '-c:a', 'aac', '-ar', '48000', '-ac', '2',
+                                '-map', '1:v:0', '-map', '0:a:0',
+                                dst
+                            ]
+                        subprocess.run(cmd_freeze, capture_output=True)
 
             elif image_src:
-                # Caso sem vídeo: renderiza imagem normalmente com a duração da cena
+                # Caso sem vídeo: renderiza imagem normalmente com áudio mudo padronizado
                 print(f"      🖼️ Cena {i+1} ({id_cena}): Imagem ({os.path.basename(image_src)}) com duração {dur_real:.2f}s")
                 renderiza_trecho_visual(
                     src=image_src, dur=dur_real, dst_path=dst,
                     fit=fit, efeito=efeito, filtro=filtro, filtro_int=filtro_int,
-                    transicao=transicao, trans_dur=trans_dur, slow_factor=1.0
+                    transicao=transicao, trans_dur=trans_dur, slow_factor=1.0,
+                    volume=0.0, resolucao=resolucao, preset=preset, crf=crf
                 )
 
             else:
-                # Nenhuma mídia encontrada -> fundo preto com a duração da cena
+                # Nenhuma mídia encontrada -> fundo preto com áudio silencioso padronizado
                 print(f"      ⚠️ Nenhuma mídia encontrada para cena {i+1} ({id_cena}) -> gerando fundo preto")
-                subprocess.run([
-                    'ffmpeg', '-y', '-f', 'lavfi',
-                    '-i', f'color=black:size={RESOLUCAO[0]}x{RESOLUCAO[1]}:duration={dur_real}',
-                    '-r', str(FPS), '-pix_fmt', 'yuv420p', dst
-                ], capture_output=True)
+                cmd_black = [
+                    'ffmpeg', '-y',
+                    '-f', 'lavfi', '-i', f'color=black:size={resolucao[0]}x{resolucao[1]}:duration={dur_real}',
+                    '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
+                    '-t', str(dur_real),
+                    '-r', str(FPS), '-pix_fmt', 'yuv420p',
+                    '-c:v', 'libx264', '-preset', preset,
+                ]
+                if crf:
+                    cmd_black.extend(['-crf', str(crf)])
+                cmd_black.extend([
+                    '-c:a', 'aac', '-ar', '48000', '-ac', '2',
+                    '-map', '0:v:0', '-map', '1:a:0',
+                    dst
+                ])
+                subprocess.run(cmd_black, capture_output=True)
 
             clips_processados.append({'path': dst, 'duration': dur_real})
 
-        if cb_status: cb_status("render", "Concatenando timeline de vídeo...", 80)
+            # Progresso real por cena e cálculo de ETA na GPU a partir da 2ª cena concluída
+            idx_cena = i + 1
+            if is_progresso:
+                eta_s = None
+                if idx_cena >= 2 and idx_cena < total_cenas:
+                    tempo_decorrido = time.time() - t_inicio_etapa_cortes
+                    tempo_medio = tempo_decorrido / float(idx_cena)
+                    cenas_restantes = total_cenas - idx_cena
+                    eta_s = int(round(tempo_medio * cenas_restantes))
+                cb_status.fracao(idx_cena / float(total_cenas), f"Cena {idx_cena} de {total_cenas}", eta_s=eta_s)
+
+        if is_progresso:
+            cb_status.inicia_etapa("concatenacao", detalhe="Unindo cenas com FFmpeg...")
+        elif cb_status:
+            cb_status("render", "Concatenando timeline de vídeo...", 80)
         concat_txt = os.path.join(tmp_dir, 'concat.txt')
         with open(concat_txt, 'w', encoding='utf-8') as f:
             for clip in clips_processados:
                 f.write(f"file '{clip['path']}'\n")
 
-        v_temp = os.path.join(tmp_dir, 'video_sem_audio.mp4')
+        v_temp = os.path.join(tmp_dir, 'video_com_som_ambiente.mp4')
         subprocess.run([
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
             '-i', concat_txt, '-c', 'copy', '-fflags', '+genpts', v_temp
         ], capture_output=True)
 
-        if cb_status: cb_status("render", "Mixando áudio e gerando MP4 final...", 90)
+        if is_progresso:
+            cb_status.inicia_etapa("mixagem", detalhe="Mixando áudio e gerando MP4 final...")
+        elif cb_status:
+            cb_status("render", "Mixando áudio e gerando MP4 final...", 90)
         
         # BGM opcional
         bgm_path = None
@@ -581,16 +980,25 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                 bgm_path = os.path.join(pasta_job, f)
                 break
 
+        # Mixagem do áudio ambiente dos clipes (0:a), voz/narração master (1:a) e BGM opcional (2:a)
         if bgm_path and os.path.exists(bgm_path):
             subprocess.run([
-                'ffmpeg', '-y', '-i', v_temp, '-i', audio_path, '-i', bgm_path,
-                '-filter_complex', '[1:a]volume=1.0[a1];[2:a]volume=0.2[a2];[a1][a2]amix=inputs=2:duration=first[aout]',
-                '-c:v', 'copy', '-c:a', 'aac', '-shortest', '-map', '0:v:0', '-map', '[aout]', saida_mp4
+                'ffmpeg', '-y',
+                '-i', v_temp,
+                '-i', audio_path,
+                '-i', bgm_path,
+                '-filter_complex', '[0:a]volume=1.0[amb];[1:a]volume=1.0[voz];[2:a]volume=0.2[bgm];[voz][amb][bgm]amix=inputs=3:duration=first:dropout_transition=2[aout]',
+                '-c:v', 'copy', '-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
+                '-shortest', '-map', '0:v:0', '-map', '[aout]', saida_mp4
             ], capture_output=True)
         else:
             subprocess.run([
-                'ffmpeg', '-y', '-i', v_temp, '-i', audio_path,
-                '-c:v', 'copy', '-c:a', 'aac', '-shortest', '-map', '0:v:0', '-map', '1:a:0', saida_mp4
+                'ffmpeg', '-y',
+                '-i', v_temp,
+                '-i', audio_path,
+                '-filter_complex', '[0:a]volume=1.0[amb];[1:a]volume=1.0[voz];[voz][amb]amix=inputs=2:duration=first:dropout_transition=2[aout]',
+                '-c:v', 'copy', '-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
+                '-shortest', '-map', '0:v:0', '-map', '[aout]', saida_mp4
             ], capture_output=True)
 
     finally:
@@ -632,15 +1040,189 @@ async def add_ngrok_bypass_headers(request, call_next):
 # Gerenciamento de status em memória
 JOBS_STATUS = {}
 
-def set_job_status(job_id: str, etapa: str, mensagem: str, progresso: int, erro: str = None):
-    JOBS_STATUS[job_id] = {
+def set_job_status(job_id: str, etapa: str, mensagem: str, progresso: int, erro: str = None, **extras):
+    status_dict = {
         "job_id": job_id,
         "etapa": etapa,
         "mensagem": mensagem,
         "progresso": progresso,
         "timestamp": datetime.now().isoformat(),
-        "erro": erro
+        "erro": erro,
+        "etapa_id": extras.get("etapa_id"),
+        "etapas": extras.get("etapas"),
+        "etapa_indice": extras.get("etapa_indice"),
+        "etapa_total": extras.get("etapa_total"),
+        "etapa_pct": extras.get("etapa_pct", 0),
+        "detalhe": extras.get("detalhe"),
+        "eta_s": extras.get("eta_s"),
     }
+    for k, v in extras.items():
+        status_dict[k] = v
+    JOBS_STATUS[job_id] = status_dict
+
+    try:
+        p_job = os.path.join(PASTA_JOBS, job_id)
+        if os.path.exists(p_job):
+            with open(os.path.join(p_job, "status.json"), "w", encoding="utf-8") as f:
+                json.dump(status_dict, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+class ProgressoJob:
+    """
+    Controlador de progresso real por etapa com pesos calibráveis,
+    cálculo acumulativo que nunca regride, medição de tempo por etapa e ETA.
+    """
+    def __init__(self, job_id: str, plano_chave: str):
+        self.job_id = job_id
+        self.plano_chave = plano_chave
+        self.definicoes = PLANOS_ETAPAS.get(plano_chave, PLANOS_ETAPAS["timeline"])
+        self.etapa_atual_id = None
+        self.etapa_atual_idx = 0
+        self.progresso_global = 0
+        self.etapa_pct = 0
+        self.detalhe = None
+        self.eta_s = None
+        self.t_inicio_etapa = None
+        self.t_fracao_recente = 0.0
+
+        self.etapas = [
+            {"id": e["id"], "nome": e["nome"], "estado": "pendente"}
+            for e in self.definicoes
+        ]
+
+    def _pesos_acumulados_anteriores(self, idx: int) -> float:
+        return sum(self.definicoes[i]["peso"] for i in range(idx))
+
+    def inicia_etapa(self, etapa_id: str, detalhe: str = None):
+        agora = time.time()
+        # Ao fim de cada etapa, imprime no console o tempo gasto para calibração de pesos
+        if self.etapa_atual_id and self.t_inicio_etapa:
+            tempo_gasto = agora - self.t_inicio_etapa
+            print(f"⏱️ {self.etapa_atual_id}: {int(round(tempo_gasto))}s")
+
+        idx = 0
+        for i, e in enumerate(self.definicoes):
+            if e["id"] == etapa_id:
+                idx = i
+                break
+
+        self.etapa_atual_id = etapa_id
+        self.etapa_atual_idx = idx
+        self.t_inicio_etapa = agora
+        self.etapa_pct = 0
+        self.detalhe = detalhe
+        self.eta_s = None
+
+        for i in range(len(self.etapas)):
+            if i < idx:
+                self.etapas[i]["estado"] = "concluida"
+            elif i == idx:
+                self.etapas[i]["estado"] = "em_andamento"
+            else:
+                if self.etapas[i]["estado"] != "erro":
+                    self.etapas[i]["estado"] = "pendente"
+
+        peso_acum = self._pesos_acumulados_anteriores(idx)
+        self.progresso_global = max(self.progresso_global, min(99, int(round(peso_acum))))
+
+        msg = self.definicoes[idx]["nome"] if idx < len(self.definicoes) else "Processando..."
+        etapa_legada = self.definicoes[idx].get("etapa_legada", "render") if idx < len(self.definicoes) else "render"
+        self._publica(etapa_legada, msg)
+
+    def fracao(self, f: float, detalhe: str = None, eta_s: float = None):
+        self.t_fracao_recente = time.time()
+        f_clamped = max(0.0, min(1.0, float(f)))
+        self.etapa_pct = int(round(f_clamped * 100))
+
+        if detalhe is not None:
+            self.detalhe = detalhe
+        if eta_s is not None:
+            self.eta_s = int(round(eta_s))
+
+        idx = self.etapa_atual_idx
+        peso_acum = self._pesos_acumulados_anteriores(idx)
+        peso_etapa = self.definicoes[idx]["peso"] if idx < len(self.definicoes) else 0
+
+        novo_prog = peso_acum + (peso_etapa * f_clamped)
+        # O progresso global nunca diminui e fica limitado a 99 até o concluído final
+        self.progresso_global = max(self.progresso_global, min(99, int(round(novo_prog))))
+
+        msg = self.definicoes[idx]["nome"] if idx < len(self.definicoes) else "Processando..."
+        etapa_legada = self.definicoes[idx].get("etapa_legada", "render") if idx < len(self.definicoes) else "render"
+        self._publica(etapa_legada, msg)
+
+    def atualiza_detalhe(self, detalhe: str):
+        self.detalhe = detalhe
+        idx = self.etapa_atual_idx
+        msg = self.definicoes[idx]["nome"] if idx < len(self.definicoes) else "Processando..."
+        etapa_legada = self.definicoes[idx].get("etapa_legada", "render") if idx < len(self.definicoes) else "render"
+        self._publica(etapa_legada, msg)
+
+    def teve_fracao_recente(self, janela_s: float = 25.0) -> bool:
+        return (time.time() - self.t_fracao_recente) < janela_s
+
+    def conclui(self, msg: str = "Job finalizado com sucesso!"):
+        agora = time.time()
+        if self.etapa_atual_id and self.t_inicio_etapa:
+            tempo_gasto = agora - self.t_inicio_etapa
+            print(f"⏱️ {self.etapa_atual_id}: {int(round(tempo_gasto))}s")
+
+        for e in self.etapas:
+            e["estado"] = "concluida"
+
+        self.progresso_global = 100
+        self.etapa_pct = 100
+        self.detalhe = None
+        self.eta_s = None
+        self._publica("concluido", msg)
+
+    def __call__(self, etapa: str, msg: str, prog: int = None, err: str = None, **extras):
+        if etapa == "concluido":
+            self.conclui(msg)
+        elif etapa == "erro":
+            if 0 <= self.etapa_atual_idx < len(self.etapas):
+                self.etapas[self.etapa_atual_idx]["estado"] = "erro"
+            set_job_status(
+                self.job_id,
+                "erro",
+                msg,
+                self.progresso_global,
+                err or msg,
+                etapa_id=self.etapa_atual_id,
+                etapas=self.etapas,
+                etapa_indice=self.etapa_atual_idx + 1,
+                etapa_total=len(self.etapas),
+                etapa_pct=self.etapa_pct,
+                detalhe=self.detalhe,
+                eta_s=None,
+            )
+        elif etapa == "inicio":
+            if not self.etapa_atual_id and self.definicoes:
+                self.inicia_etapa(self.definicoes[0]["id"], detalhe=msg)
+            else:
+                self._publica("inicio", msg)
+        else:
+            if prog is not None:
+                self.progresso_global = max(self.progresso_global, min(99, prog))
+            self._publica(etapa, msg)
+
+    def _publica(self, etapa_legada: str, msg: str):
+        set_job_status(
+            self.job_id,
+            etapa_legada,
+            msg,
+            self.progresso_global,
+            None,
+            etapa_id=self.etapa_atual_id,
+            etapas=self.etapas,
+            etapa_indice=self.etapa_atual_idx + 1,
+            etapa_total=len(self.etapas),
+            etapa_pct=self.etapa_pct,
+            detalhe=self.detalhe,
+            eta_s=self.eta_s,
+        )
 
 @app.get("/")
 @app.get("/status")
@@ -667,13 +1249,46 @@ def get_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job não encontrado")
     return JOBS_STATUS[job_id]
 
-def processa_job_background(job_id: str, tipo: str):
+def processa_job_background(job_id: str, tipo: str, formato: str = "", qualidade: str = ""):
     pasta_job = os.path.join(PASTA_JOBS, job_id)
-    cb = lambda etapa, msg, prog, err=None: set_job_status(job_id, etapa, msg, prog, err)
-    cb("inicio", "Iniciando processamento na GPU...", 5)
+
+    # Resolução do perfil de vídeo configurado
+    perfil = resolve_perfil(formato, qualidade)
+    resolucao_job = perfil["resolucao"]
+    preset_job = perfil["preset"]
+    crf_job = perfil["crf"]
+
+    # Verifica se já temos timeline.json pronta (enviada diretamente pelo App na renderização)
+    timeline_enviada = os.path.join(pasta_job, "timeline.json")
+    usando_timeline_pronta = False
+    instrucoes = []
+    duracao_audio = 0.0
+
+    if tipo == 'render' and os.path.exists(timeline_enviada):
+        try:
+            with open(timeline_enviada, 'r', encoding='utf-8') as f:
+                tl_pronta = json.load(f)
+            if 'cenas' in tl_pronta and len(tl_pronta['cenas']) > 0:
+                instrucoes = tl_pronta['cenas']
+                duracao_audio = float(tl_pronta.get('duracao_total', 0.0))
+                usando_timeline_pronta = True
+                print(f"🎬 Usando timeline enviada pelo App: {len(instrucoes)} cenas")
+        except Exception as e:
+            print(f"⚠️ Erro ao ler timeline.json enviada: {e}")
+
+    # Escolhe o plano de etapas e instancia ProgressoJob
+    if tipo == 'timeline':
+        plano_chave = 'timeline'
+    elif usando_timeline_pronta:
+        plano_chave = 'render_com_timeline'
+    else:
+        plano_chave = 'timeline_e_render'
+
+    progresso = ProgressoJob(job_id, plano_chave)
+    progresso.inicia_etapa("preparo", detalhe="Verificando arquivos recebidos...")
 
     try:
-        # Acha áudio
+        # Acha áudio principal
         audio_path = None
         for f in os.listdir(pasta_job):
             if eh_audio(f) and not f.lower().startswith('bgm.'):
@@ -681,24 +1296,6 @@ def processa_job_background(job_id: str, tipo: str):
                 break
         if not audio_path:
             raise FileNotFoundError("Nenhum arquivo de áudio principal (.mp3/.wav/etc) foi enviado no job")
-
-        # Verifica se já temos timeline.json pronta (enviada diretamente pelo App na renderização)
-        timeline_enviada = os.path.join(pasta_job, "timeline.json")
-        usando_timeline_pronta = False
-        instrucoes = []
-        duracao_audio = 0.0
-
-        if tipo == 'render' and os.path.exists(timeline_enviada):
-            try:
-                with open(timeline_enviada, 'r', encoding='utf-8') as f:
-                    tl_pronta = json.load(f)
-                if 'cenas' in tl_pronta and len(tl_pronta['cenas']) > 0:
-                    instrucoes = tl_pronta['cenas']
-                    duracao_audio = float(tl_pronta.get('duracao_total', 0.0))
-                    usando_timeline_pronta = True
-                    print(f"🎬 Usando timeline enviada pelo App: {len(instrucoes)} cenas")
-            except Exception as e:
-                print(f"⚠️ Erro ao ler timeline.json enviada: {e}")
 
         if not usando_timeline_pronta:
             # Acha roteiro
@@ -717,36 +1314,45 @@ def processa_job_background(job_id: str, tipo: str):
             total_visuais = len(unidades_visuais)
             blocos = le_roteiro_conteudo(conteudo_roteiro, total_visuais)
 
-            # Transcrição Whisper
-            palavras, duracao_audio = transcreve_audio(audio_path, cb)
+            # Se o roteiro tiver mais blocos que o total de mídias visuais enviadas,
+            # limita o número de blocos para coincidir exatamente com as mídias, consolidando o texto excedente.
+            # Isso impede categoricamente que cenas extras no final repitam 0001.mp4!
+            if total_visuais > 0 and len(blocos) > total_visuais:
+                texto_extra = " ".join([b['texto'] for b in blocos[total_visuais:] if b.get('texto')])
+                blocos = blocos[:total_visuais]
+                if texto_extra and blocos:
+                    blocos[-1]['texto'] = f"{blocos[-1]['texto']} {texto_extra}".strip()
+                print(f"✂️ Limitando para {total_visuais} cenas para coincidir com as mídias enviadas.")
 
-            # Mapeamento
-            instrucoes = mapeia_timeline(palavras, duracao_audio, blocos, cb)
+            # Transcrição Whisper com progresso real de frames
+            palavras, duracao_audio = transcreve_audio(audio_path, progresso)
+
+            # Mapeamento e sincronia de roteiro bloco a bloco
+            instrucoes = mapeia_timeline(palavras, duracao_audio, blocos, progresso)
 
             def acha_midia_job(id_cena, idx):
                 id_str = str(id_cena).strip().lower()
                 id_clean = id_str.lstrip('0') or '0'
+                id_digits = re.sub(r'\D', '', id_str).lstrip('0') or '0'
 
                 # 1. Correspondência exata de ID ou nome base na lista de unidades agrupadas
                 for u in unidades_visuais:
                     b = u['base']
                     b_clean = b.lstrip('0') or '0'
-                    if b == id_str or b_clean == id_clean:
+                    b_digits = re.sub(r'\D', '', b).lstrip('0') or '0'
+                    if b == id_str or b_clean == id_clean or (b_digits and b_digits == id_digits):
                         return u['arquivo_principal'], u['tipo']
 
-                # 2. Correspondência parcial
+                # 2. Correspondência parcial ou contenção
                 for u in unidades_visuais:
                     b = u['base']
                     b_clean = b.lstrip('0') or '0'
-                    if id_str in b or (id_clean and id_clean in b):
+                    if id_str in b or b in id_str or (id_clean and (id_clean in b or b in id_clean)):
                         return u['arquivo_principal'], u['tipo']
 
-                # 3. Fallback sequencial por índice de unidades (nunca pega imagens complementares avulsas!)
+                # 3. Fallback sequencial por índice de unidades (sem nunca ciclar com % para não repetir 0001.mp4)
                 if idx < len(unidades_visuais):
                     u = unidades_visuais[idx]
-                    return u['arquivo_principal'], u['tipo']
-                elif unidades_visuais:
-                    u = unidades_visuais[idx % len(unidades_visuais)]
                     return u['arquivo_principal'], u['tipo']
 
                 return f"{id_cena}.jpg", 'imagem'
@@ -778,6 +1384,8 @@ def processa_job_background(job_id: str, tipo: str):
                 "cenas": cenas_json
             }
 
+            # Etapa de gravação da timeline.json
+            progresso.inicia_etapa("finalizacao", detalhe="Salvando timeline.json...")
             saida_json = os.path.join(pasta_job, "timeline.json")
             with open(saida_json, 'w', encoding='utf-8') as f:
                 json.dump(timeline_data, f, ensure_ascii=False, indent=2)
@@ -785,23 +1393,47 @@ def processa_job_background(job_id: str, tipo: str):
         # Renderização em MP4 se solicitada
         if tipo in ['timeline_e_render', 'render']:
             saida_mp4 = os.path.join(pasta_job, "video_final.mp4")
-            renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4, cb)
+            renderiza_video(
+                instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4, progresso,
+                resolucao=resolucao_job, preset=preset_job, crf=crf_job,
+                formato=formato, qualidade=qualidade
+            )
 
-        cb("concluido", "Job finalizado com sucesso!", 100)
+        progresso.conclui("Job finalizado com sucesso!")
     except Exception as e:
         print(f"❌ Erro no job {job_id}: {e}")
-        cb("erro", f"Erro: {str(e)}", 0, str(e))
+        progresso("erro", f"Erro: {str(e)}", err=str(e))
 
 @app.post("/api/enviar_job")
 async def enviar_job(
     background_tasks: BackgroundTasks,
     tipo: str = Form("timeline"),
+    formato: str = Form(""),
+    qualidade: str = Form(""),
     arquivos: List[UploadFile] = File(...)
 ):
     """
     Recebe os arquivos enviados diretamente pelo frontend do PC (via formulário multipart)
     sem precisar salvar nem sincronizar nada no Google Drive!
     """
+    f_clean = (formato or "").strip()
+    q_clean = (qualidade or "").strip()
+
+    # Validação de formato e qualidade contra whitelist
+    formatos_validos = ["16:9", "9:16", "1:1"]
+    qualidades_validas = ["480p", "720p", "1080p"]
+
+    if f_clean and f_clean not in formatos_validos:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Formato de renderização inválido: '{f_clean}'. Formatos suportados: 16:9, 9:16, 1:1."
+        )
+    if q_clean and q_clean not in qualidades_validas:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Qualidade de renderização inválida: '{q_clean}'. Qualidades suportadas: 480p, 720p, 1080p."
+        )
+
     job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     pasta_job = os.path.join(PASTA_JOBS, job_id)
     os.makedirs(pasta_job, exist_ok=True)
@@ -813,8 +1445,9 @@ async def enviar_job(
         with open(destino, "wb") as buffer:
             shutil.copyfileobj(arq.file, buffer)
 
-    set_job_status(job_id, "recebido", f"{len(arquivos)} arquivos recebidos no Colab", 10)
-    background_tasks.add_task(processa_job_background, job_id, tipo)
+    info_perfil = f" [{f_clean} {q_clean}]" if (f_clean and q_clean) else ""
+    set_job_status(job_id, "recebido", f"{len(arquivos)} arquivos recebidos no Colab{info_perfil}", 10)
+    background_tasks.add_task(processa_job_background, job_id, tipo, f_clean, q_clean)
 
     return {
         "status": "sucesso",
@@ -847,13 +1480,26 @@ def inicia_servidor():
         '''))
         return
 
-    ngrok.set_auth_token(token)
+    try:
+        ngrok.set_auth_token(token)
+    except Exception as e:
+        # pyngrok acusa erro caso o token já esteja salvo no arquivo ngrok.yml
+        if "already set" not in str(e).lower():
+            raise e
 
     # Mata processos antigos e fecha túneis
     try:
         ngrok.kill()
     except Exception:
         pass
+
+    # Pré-carrega o modelo Whisper na GPU/VRAM antes de abrir o túnel
+    print("⏳ Pré-carregando Whisper na GPU/VRAM para resposta imediata no primeiro job...")
+    try:
+        get_whisper()
+        print(f"✅ Whisper ({WHISPER_MODEL}) carregado e pronto na memória!")
+    except Exception as e:
+        print(f"⚠️ Aviso ao pré-carregar Whisper: {e} (será tentado novamente sob demanda se necessário)")
 
     # Inicia Uvicorn em uma thread separada para não travar o notebook
     def roda_uvicorn():
@@ -1011,6 +1657,19 @@ def inicia_servidor():
             setTimeout(function() {{ btnText.innerText = "Copiar URL"; }}, 2500);
         }});
     }}
+
+    // Anti-desconexão contínuo no navegador (executa a cada 60s)
+    setInterval(function() {{
+        try {{
+            var btn = document.querySelector("#top-toolbar > colab-connect-button") ||
+                      document.querySelector("colab-connect-button") ||
+                      document.querySelector("#connect");
+            if (btn) {{
+                btn.click();
+                console.log("[keep-alive] clique automático executado: " + new Date().toLocaleTimeString());
+            }}
+        }} catch(e) {{}}
+    }}, 60000);
     </script>
     '''
     display(HTML(card_html))
@@ -1022,6 +1681,8 @@ def inicia_servidor():
             time.sleep(60)
     except KeyboardInterrupt:
         print("🔴 Parando motor...")
+        global _keep_alive_ativo
+        _keep_alive_ativo = False
         ngrok.disconnect(public_url)
 
 # Executa

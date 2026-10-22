@@ -119,6 +119,7 @@ export const InspectorPanel: React.FC<InspectorPanelProps> = ({
                 onVolumeChange={onVolumeChange}
                 onToggleDucking={onToggleDucking}
                 onUpdateClip={onUpdateClip}
+                onApplyToAllVideos={onApplyToAllVideos}
               />
             )}
           </>

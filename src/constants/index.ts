@@ -1,8 +1,5 @@
 import { Track } from '../types';
 
-export const CLIENT_ID = '825962387496-lccer4g2sijjktrp9k3q3uh9mkd30du4.apps.googleusercontent.com';
-export const SCOPE = 'https://www.googleapis.com/auth/drive';
-export const MOTOR_ROOT = 'MotorDobra';
 export const PPS = 40; // pixels por segundo na timeline base
 
 export const TRACKS: Track[] = [

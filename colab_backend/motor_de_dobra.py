@@ -89,6 +89,12 @@ def eh_visual(filename):
     """Verifica se o arquivo é visual (vídeo OU imagem)."""
     return get_ext(filename) in EXTENSOES_VISUAIS
 
+ARQUIVOS_IGNORADOS = {
+    'audio', 'bgm', 'narration', 'narracao', 'voz', 'trilha', 'music', 'musica',
+    'video_final', 'video_sem_audio', 'saida', 'output', 'export', 'temp', 'preview',
+    'status', 'timeline', 'roteiro', 'sub_concat', 'concat'
+}
+
 def obtem_unidades_visuais(pasta):
     """
     Agrupa os arquivos visuais da pasta por nome base (sem extensão).
@@ -114,8 +120,11 @@ def obtem_unidades_visuais(pasta):
     for f in arquivos:
         if not eh_visual(f) or eh_audio(f):
             continue
-        # Ignora arquivos ocultos ou arquivos de áudio/música
-        if f.startswith('.') or nome_base_sem_ext(f).lower() in ['audio', 'bgm', 'narration']:
+        # Ignora arquivos ocultos, de áudio ou arquivos gerados/auxiliares
+        base_limpa = nome_base_sem_ext(f).lower()
+        if f.startswith('.') or f.startswith('_') or base_limpa in ARQUIVOS_IGNORADOS:
+            continue
+        if any(ign in base_limpa for ign in ['video_final', 'video_sem_audio', 'output_final', 'sub_concat', 'concat']):
             continue
 
         base = nome_base_sem_ext(f).lower()
@@ -168,9 +177,11 @@ def _keep_alive_loop():
             break
         try:
             display(Javascript('''
-                var btn = document.querySelector("#top-toolbar > colab-connect-button");
+                var btn = document.querySelector("#top-toolbar > colab-connect-button") ||
+                          document.querySelector("colab-connect-button") ||
+                          document.querySelector("#connect");
                 if (btn) btn.click();
-                console.log("[keep-alive] pulso: " + new Date().toLocaleTimeString());
+                console.log("[keep-alive] pulso anti-inatividade: " + new Date().toLocaleTimeString());
             '''))
         except Exception:
             pass
@@ -273,12 +284,17 @@ def normaliza(texto):
 def le_roteiro(roteiro_path, pasta_projeto=None):
     with open(roteiro_path, 'r', encoding='utf-8') as f:
         conteudo = f.read()
-    partes = re.split(r'\[(?:cena|bloco)\s*(\d+)\]', conteudo, flags=re.IGNORECASE)
+    # Regex robusto para capturar [CENA0001], [CENA 1], [CENA_0001], [BLOCO 1], [0001], CENA 0001:, etc.
+    padrao = r'(?:^|\n)\s*\[?\s*(?:cena|bloco)?\s*[_:\-]?\s*(\d+)\s*\]?\s*[:\-]?\s*(?:\n|$)'
+    partes = re.split(padrao, '\n' + conteudo, flags=re.IGNORECASE)
     blocos = []
     for i in range(1, len(partes), 2):
         txt = partes[i+1].strip() if i+1 < len(partes) else ''
         if txt:
-            blocos.append({"num": int(partes[i]), "texto": txt})
+            # Remove anotações residuais visuais/técnicas que não fazem parte da locução
+            txt_limpo = re.sub(r'\[(?:visual|efeito|audio|camera|b-roll)[^\]]*\]', '', txt, flags=re.IGNORECASE).strip()
+            num_val = int(partes[i])
+            blocos.append({"num": num_val, "id_cena": f"{num_val:04d}", "texto": txt_limpo or txt})
 
     # Fallback: se não houver tags [cena X], divide por parágrafos ou número de mídias visuais
     if not blocos and conteudo.strip():
@@ -292,78 +308,132 @@ def le_roteiro(roteiro_path, pasta_projeto=None):
             chunk = max(1, len(linhas) // n_midias)
             for idx in range(n_midias):
                 sub_txt = " ".join(linhas[idx*chunk : (idx+1)*chunk]) if idx < n_midias - 1 else " ".join(linhas[idx*chunk:])
-                blocos.append({"num": idx + 1, "texto": sub_txt or f"Cena {idx+1}"})
+                num_val = idx + 1
+                blocos.append({"num": num_val, "id_cena": f"{num_val:04d}", "texto": sub_txt or f"Cena {num_val}"})
         else:
             for idx, lin in enumerate(linhas):
-                blocos.append({"num": idx + 1, "texto": lin})
+                num_val = idx + 1
+                blocos.append({"num": num_val, "id_cena": f"{num_val:04d}", "texto": lin})
+
+    # Limita o número de cenas ao total de unidades visuais disponíveis
+    if pasta_projeto and os.path.exists(pasta_projeto):
+        unidades = obtem_unidades_visuais(pasta_projeto)
+        if unidades and len(blocos) > len(unidades):
+            texto_extra = " ".join([b['texto'] for b in blocos[len(unidades):] if b.get('texto')])
+            blocos = blocos[:len(unidades)]
+            if texto_extra and blocos:
+                blocos[-1]['texto'] = f"{blocos[-1]['texto']} {texto_extra}".strip()
+            print(f"✂️ Limitando para {len(unidades)} cenas para coincidir com as mídias disponíveis.")
 
     return blocos
 
 def mapeia_cenas(palavras, duracao_audio, blocos, pasta_job=None):
     if pasta_job:
-        grava_status(pasta_job, "matching", "Mapeando cenas...", 30)
+        grava_status(pasta_job, "matching", "Mapeando sincronia exata das cenas...", 30)
+
+    if not blocos:
+        return []
+
+    if not palavras or duracao_audio <= 0:
+        dur_por_cena = duracao_audio / max(len(blocos), 1)
+        instrucoes = []
+        for i, b in enumerate(blocos):
+            t_ini = round(i * dur_por_cena, 3)
+            t_fim = round((i + 1) * dur_por_cena, 3) if i < len(blocos) - 1 else round(duracao_audio, 3)
+            instrucoes.append({
+                "id_cena":    b.get("id_cena", f"{b['num']:04d}"),
+                "start":      t_ini,
+                "end":        t_fim,
+                "duration":   round(max(0.1, t_fim - t_ini), 3),
+                "score":      0.5,
+                "effect":     "none",
+                "transition": "none",
+            })
+        return instrucoes
 
     whisper_norm = []
     for w in palavras:
         tok = normaliza(w['word'])
         whisper_norm.append(tok[0] if tok else '')
 
-    total_rot = sum(len(normaliza(b['texto'])) for b in blocos)
-    escala    = len(palavras) / max(total_rot, 1)
+    n_palavras = len(whisper_norm)
+    total_rot  = sum(len(normaliza(b['texto'])) for b in blocos)
+    escala     = n_palavras / max(total_rot, 1)
 
-    def acha_fim(bloco_norm, ponteiro, janela_max, n_ancora=5):
-        ancora = bloco_norm[-n_ancora:] if len(bloco_norm) >= n_ancora else bloco_norm
-        n      = len(ancora)
-        limite = min(ponteiro + janela_max, len(whisper_norm) - n)
-        melhor_score, melhor_idx = -1, ponteiro
-        for j in range(ponteiro, limite + 1):
-            score = SequenceMatcher(None, ancora, whisper_norm[j:j+n]).ratio()
-            if score > melhor_score:
-                melhor_score, melhor_idx = score, j + n - 1
-        return melhor_idx, melhor_score
+    # Transição contígua exata entre Cena i e Cena i+1
+    def encontra_corte_entre_cenas(bloco_atual, bloco_prox, ptr_min, ptr_max):
+        prox_words = normaliza(bloco_prox['texto'])
+        ancora_ini = prox_words[:min(5, len(prox_words))]
+        n_ini = len(ancora_ini)
+
+        atual_words = normaliza(bloco_atual['texto'])
+        ancora_fim = atual_words[-min(4, len(atual_words)):] if len(atual_words) >= 4 else atual_words
+        n_fim = len(ancora_fim)
+
+        melhor_idx_corte = -1
+        melhor_score = -1.0
+
+        limite = min(ptr_max, n_palavras - max(n_ini, 1))
+        for j in range(ptr_min, max(ptr_min + 1, limite + 1)):
+            sub_ini = whisper_norm[j : j + n_ini]
+            score_ini = SequenceMatcher(None, ancora_ini, sub_ini).ratio() if n_ini > 0 else 0.0
+
+            score_fim = 0.0
+            if j >= n_fim and n_fim > 0:
+                sub_fim = whisper_norm[j - n_fim : j]
+                score_fim = SequenceMatcher(None, ancora_fim, sub_fim).ratio()
+
+            score_total = (score_ini * 0.75) + (score_fim * 0.25) if score_fim > 0 else score_ini
+            if score_total > melhor_score:
+                melhor_score = score_total
+                melhor_idx_corte = j
+
+        if melhor_score < 0.35:
+            len_atual = len(normaliza(bloco_atual['texto']))
+            melhor_idx_corte = min(ptr_min + max(1, int(len_atual * escala)), n_palavras - 1)
+            melhor_score = 0.35
+
+        return melhor_idx_corte, melhor_score
+
+    pontos_corte = [0.0]
+    scores = []
+    ptr = 0
+
+    for i in range(len(blocos) - 1):
+        bloco_atual = blocos[i]
+        bloco_prox  = blocos[i+1]
+
+        len_atual = len(normaliza(bloco_atual['texto']))
+        ptr_min = max(0, ptr + max(1, int(len_atual * escala * 0.4)))
+        ptr_max = min(n_palavras, ptr + int(len_atual * escala * 1.6) + MARGEM_EXTRA + 10)
+
+        idx_corte, score = encontra_corte_entre_cenas(bloco_atual, bloco_prox, ptr_min, ptr_max)
+        t_corte = palavras[idx_corte]['start'] if idx_corte < len(palavras) else duracao_audio
+        t_corte = max(t_corte, pontos_corte[-1] + 0.3)
+        pontos_corte.append(round(t_corte, 3))
+        scores.append(round(score, 2))
+        ptr = max(ptr + 1, idx_corte)
+
+    pontos_corte.append(round(duracao_audio, 3))
+    scores.append(1.0)
 
     instrucoes = []
-    ponteiro   = 0
-
-    for i, bloco in enumerate(tqdm(blocos, desc="🗺️ Mapeando")):
-        bloco_norm = normaliza(bloco['texto'])
-        if not bloco_norm:
-            continue
-        janela_max     = int(len(bloco_norm) * escala) + MARGEM_EXTRA
-        idx_fim, score = acha_fim(bloco_norm, ponteiro, janela_max)
-
-        if score < 0.35:
-            idx_fim = min(ponteiro + int(len(bloco_norm) * escala), len(palavras) - 1)
-
-        t_start = palavras[ponteiro]['start'] if ponteiro < len(palavras) else duracao_audio
-
-        # Sincronia perfeita: primeira cena sempre inicia em 0.0
-        if i == 0:
-            t_start = 0.0
-
-        t_end   = palavras[idx_fim]['end'] if idx_fim < len(palavras) else duracao_audio
-
-        if i > 0:
-            t_start = max(t_start, instrucoes[-1]['end'])
-        t_end = max(t_end, t_start + 0.3)
+    for i in range(len(blocos)):
+        t_ini = pontos_corte[i]
+        t_fim = pontos_corte[i+1]
+        dur = round(max(0.1, t_fim - t_ini), 3)
 
         instrucoes.append({
-            "id_cena":    f"{bloco['num']:04d}",
-            "start":      round(t_start, 3),
-            "end":        round(t_end, 3),
-            "duration":   round(t_end - t_start, 3),
-            "score":      round(score, 2),
+            "id_cena":    blocos[i].get("id_cena", f"{blocos[i]['num']:04d}"),
+            "start":      round(t_ini, 3),
+            "end":        round(t_fim, 3),
+            "duration":   dur,
+            "score":      scores[i] if i < len(scores) else 0.9,
             "effect":     "none",
             "transition": "none",
         })
-        ponteiro = idx_fim + 1
 
-    if instrucoes:
-        instrucoes[-1]['end']      = duracao_audio
-        instrucoes[-1]['duration'] = round(duracao_audio - instrucoes[-1]['start'], 3)
-
-    scores = [c['score'] for c in instrucoes]
-    print(f"✅ {len(instrucoes)} cenas | score médio: {sum(scores)/len(scores):.2f}")
+    print(f"✅ {len(instrucoes)} cenas contíguas | score médio: {sum(scores)/len(scores):.2f}")
     return instrucoes
 
 
@@ -377,24 +447,24 @@ def exporta_timeline_json(instrucoes, pasta_projeto, audio_path,
     def acha_midia(pasta, id_cena, idx):
         id_str = str(id_cena).strip().lower()
         id_clean = id_str.lstrip('0') or '0'
-        # 1. Correspondência exata por base ou ID
+        id_digits = re.sub(r'\D', '', id_str).lstrip('0') or '0'
+
+        # 1. Correspondência exata por base, ID ou dígitos
         for u in unidades_visuais:
             b = u['base']
             b_clean = b.lstrip('0') or '0'
-            if b == id_str or b_clean == id_clean:
+            b_digits = re.sub(r'\D', '', b).lstrip('0') or '0'
+            if b == id_str or b_clean == id_clean or (b_digits and b_digits == id_digits):
                 return u['arquivo_principal'], u['tipo']
         # 2. Correspondência parcial
         for u in unidades_visuais:
             b = u['base']
             b_clean = b.lstrip('0') or '0'
-            if id_str in b or (id_clean and id_clean in b):
+            if id_str in b or b in id_str or (id_clean and (id_clean in b or b in id_clean)):
                 return u['arquivo_principal'], u['tipo']
-        # 3. Fallback sequencial por índice de unidades visuais
+        # 3. Fallback sequencial por índice de unidades visuais (sem ciclar com %)
         if idx < len(unidades_visuais):
             u = unidades_visuais[idx]
-            return u['arquivo_principal'], u['tipo']
-        elif unidades_visuais:
-            u = unidades_visuais[idx % len(unidades_visuais)]
             return u['arquivo_principal'], u['tipo']
         return f"{id_cena}.jpg", 'imagem'
 
@@ -423,6 +493,7 @@ def exporta_timeline_json(instrucoes, pasta_projeto, audio_path,
             "transition":    "none",
             "effect":        "none",
             "offset":        0,
+            "volume":        0.0,
         })
 
     payload = {
@@ -447,9 +518,23 @@ def exporta_timeline_json(instrucoes, pasta_projeto, audio_path,
 # NÚCLEO — RENDER
 # ==============================================================================
 def obtem_duracao_midia(path: str) -> float:
-    """Obtém a duração exata de um arquivo de vídeo ou áudio em segundos via ffprobe."""
+    """Obtém a duração exata do stream de vídeo/áudio via ffprobe."""
     if not path or not os.path.exists(path):
         return 0.0
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'v:0',
+            '-show_entries', 'stream=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            path
+        ]
+        out = subprocess.check_output(cmd, text=True).strip()
+        if out and out != 'N/A':
+            val = float(out)
+            if val > 0.05: return val
+    except Exception:
+        pass
     try:
         cmd = [
             'ffprobe', '-v', 'error',
@@ -468,17 +553,37 @@ def obtem_duracao_midia(path: str) -> float:
         except Exception:
             return 0.0
 
-def renderiza_trecho_visual(src, dur, dst_path, fit='contain', efeito='none', filtro='none', filtro_int=100, transicao='none', trans_dur=0.8, slow_factor=1.0):
+def video_tem_audio(path: str) -> bool:
+    """Verifica se o arquivo de vídeo possui uma faixa de áudio válida."""
+    if not path or not os.path.exists(path):
+        return False
+    try:
+        cmd = [
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'a:0',
+            '-show_entries', 'stream=codec_type',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            path
+        ]
+        out = subprocess.check_output(cmd, text=True).strip()
+        return bool(out and 'audio' in out.lower())
+    except Exception:
+        return False
+
+def renderiza_trecho_visual(src, dur, dst_path, fit='contain', efeito='none', filtro='none', filtro_int=100, transicao='none', trans_dur=0.8, slow_factor=1.0, volume=0.0):
     is_vid = eh_video(src)
     vf_parts = []
+
+    if is_vid:
+        if slow_factor > 1.001:
+            vf_parts.append(f"setpts=(PTS-STARTPTS)*{slow_factor:.5f}")
+        else:
+            vf_parts.append("setpts=PTS-STARTPTS")
 
     if fit == 'cover':
         vf_parts.append(f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=increase,crop={RESOLUCAO[0]}:{RESOLUCAO[1]}")
     else:
         vf_parts.append(f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=decrease,pad={RESOLUCAO[0]}:{RESOLUCAO[1]}:(ow-iw)/2:(oh-ih)/2:black")
-
-    if is_vid and slow_factor > 1.001:
-        vf_parts.append(f"setpts={slow_factor:.5f}*PTS")
 
     if not is_vid:
         nb_frames = max(1, int(dur * FPS))
@@ -511,32 +616,36 @@ def renderiza_trecho_visual(src, dur, dst_path, fit='contain', efeito='none', fi
     vf_parts.append(f"fps={FPS}")
     vf_chain = ",".join(vf_parts)
 
-    cmd = ['ffmpeg', '-y']
-    if is_vid: cmd.extend(['-stream_loop', '-1'])
-    else: cmd.extend(['-loop', '1'])
+    tem_som_valido = is_vid and (float(volume) > 0.001) and video_tem_audio(src)
 
-    cmd.extend([
-        '-i', src, '-t', str(dur),
-        '-vf', vf_chain,
-        '-c:v', 'libx264', '-preset', 'fast',
-        '-pix_fmt', 'yuv420p',
-        '-video_track_timescale', '90000',
-        '-an', dst_path
-    ])
-    res = subprocess.run(cmd, capture_output=True)
+    if tem_som_valido:
+        af_parts = []
+        if slow_factor > 1.001:
+            af_parts.append(f"atempo={max(0.5, 1.0/slow_factor):.5f}")
+        af_parts.append(f"volume={float(volume):.2f}")
+        af_chain = ",".join(af_parts)
 
-    if res.returncode != 0:
-        cmd_fallback = ['ffmpeg', '-y']
-        if is_vid: cmd_fallback.extend(['-stream_loop', '-1'])
-        else: cmd_fallback.extend(['-loop', '1'])
-        vf_simple = f"scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=decrease,pad={RESOLUCAO[0]}:{RESOLUCAO[1]}:(ow-iw)/2:(oh-ih)/2:black,fps={FPS}"
-        cmd_fallback.extend([
+        cmd = [
+            'ffmpeg', '-y', '-i', src, '-t', str(dur),
+            '-vf', vf_chain, '-af', af_chain,
+            '-c:v', 'libx264', '-preset', 'fast', '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-ar', '48000', '-ac', '2',
+            '-video_track_timescale', '90000',
+            dst_path
+        ]
+    else:
+        cmd = [
+            'ffmpeg', '-y',
+            '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
             '-i', src, '-t', str(dur),
-            '-vf', vf_simple,
-            '-c:v', 'libx264', '-preset', 'fast',
-            '-pix_fmt', 'yuv420p', '-video_track_timescale', '90000', '-an', dst_path
-        ])
-        subprocess.run(cmd_fallback, capture_output=True)
+            '-vf', vf_chain,
+            '-c:v', 'libx264', '-preset', 'fast', '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac', '-ar', '48000', '-ac', '2',
+            '-map', '1:v:0', '-map', '0:a:0',
+            '-video_track_timescale', '90000',
+            dst_path
+        ]
+    subprocess.run(cmd, capture_output=True)
 
 def renderiza(instrucoes, pasta_projeto, audio_path,
               duracao_audio, saida_path, pasta_job=None):
@@ -565,6 +674,7 @@ def renderiza(instrucoes, pasta_projeto, audio_path,
             filtro     = cena.get('filter', 'none')
             filtro_int = int(cena.get('filter_intensity', 100))
             fit        = cena.get('fit', 'contain')
+            volume     = float(cena.get('volume', 0.0))
 
             id_str = str(id_cena).strip().lower()
             id_clean = id_str.lstrip('0') or '0'
@@ -572,11 +682,13 @@ def renderiza(instrucoes, pasta_projeto, audio_path,
             base_decl_clean = base_decl.lstrip('0') or '0'
 
             unidade = None
+            id_digits = re.sub(r'\D', '', id_str).lstrip('0') or '0'
             for u in unidades_visuais:
                 b = u['base']
                 b_clean = b.lstrip('0') or '0'
+                b_digits = re.sub(r'\D', '', b).lstrip('0') or '0'
                 if (arquivo and (arquivo.lower() == (u['video'] or '').lower() or arquivo.lower() == (u['imagem'] or '').lower())) \
-                   or b == base_decl or b_clean == base_decl_clean:
+                   or b == base_decl or b_clean == base_decl_clean or (b_digits and b_digits == id_digits):
                     unidade = u
                     break
 
@@ -584,15 +696,13 @@ def renderiza(instrucoes, pasta_projeto, audio_path,
                 for u in unidades_visuais:
                     b = u['base']
                     b_clean = b.lstrip('0') or '0'
-                    if b == id_str or b_clean == id_clean or id_str in b or (id_clean and id_clean in b):
+                    b_digits = re.sub(r'\D', '', b).lstrip('0') or '0'
+                    if b == id_str or b_clean == id_clean or (b_digits and b_digits == id_digits) or id_str in b or b in id_str:
                         unidade = u
                         break
 
-            if not unidade:
-                if i < len(unidades_visuais):
-                    unidade = unidades_visuais[i]
-                elif unidades_visuais:
-                    unidade = unidades_visuais[i % len(unidades_visuais)]
+            if not unidade and i < len(unidades_visuais):
+                unidade = unidades_visuais[i]
 
             video_src = unidade['video_path'] if unidade else None
             image_src = unidade['image_path'] if unidade else None
@@ -612,28 +722,102 @@ def renderiza(instrucoes, pasta_projeto, audio_path,
             if video_src and dur_vid > 0.05:
                 # Caso A: corte se cena <= vídeo
                 if dur_real <= dur_vid:
-                    renderiza_trecho_visual(video_src, dur_real, dst, fit, efeito, filtro, filtro_int, transicao, trans_dur, slow_factor=1.0)
+                    print(f"      🎬 Cena {i+1} ({id_cena}): Vídeo ({dur_vid:.2f}s) CORTADO para encaixar na cena ({dur_real:.2f}s) | Vol: {int(volume*100)}%")
+                    renderiza_trecho_visual(
+                        src=video_src, dur=dur_real, dst_path=dst,
+                        fit=fit, efeito=efeito, filtro=filtro, filtro_int=filtro_int,
+                        transicao=transicao, trans_dur=trans_dur, slow_factor=1.0,
+                        volume=volume
+                    )
                 # Caso B: slow motion se até 40% maior
                 elif dur_real <= (dur_vid * 1.40):
                     fator_slow = dur_real / dur_vid
-                    renderiza_trecho_visual(video_src, dur_real, dst, fit, efeito, filtro, filtro_int, transicao, trans_dur, slow_factor=fator_slow)
+                    print(f"      🎬 Cena {i+1} ({id_cena}): Vídeo ({dur_vid:.2f}s) DESACELERADO ({fator_slow:.2f}x) para preencher a cena ({dur_real:.2f}s) | Vol: {int(volume*100)}%")
+                    renderiza_trecho_visual(
+                        src=video_src, dur=dur_real, dst_path=dst,
+                        fit=fit, efeito=efeito, filtro=filtro, filtro_int=filtro_int,
+                        transicao=transicao, trans_dur=trans_dur, slow_factor=fator_slow,
+                        volume=volume
+                    )
                 # Caso C: vídeo normal + completa com imagem
                 else:
-                    dur_p_vid = dur_vid
-                    dur_p_img = max(0.1, round(dur_real - dur_vid, 3))
-                    p1 = os.path.join(tmp_dir, f"c_{i:04d}_p1.mp4")
-                    p2 = os.path.join(tmp_dir, f"c_{i:04d}_p2.mp4")
-                    renderiza_trecho_visual(video_src, dur_p_vid, p1, fit, 'none', filtro, filtro_int, transicao, trans_dur, slow_factor=1.0)
-                    src_img = image_src if image_src else video_src
-                    renderiza_trecho_visual(src_img, dur_p_img, p2, fit, efeito, filtro, filtro_int, 'none', trans_dur, slow_factor=1.0)
-                    sub_txt = os.path.join(tmp_dir, f"sub_{i:04d}.txt")
-                    with open(sub_txt, 'w', encoding='utf-8') as f:
-                        f.write(f"file '{p1}'\nfile '{p2}'\n")
-                    subprocess.run(['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', sub_txt, '-c', 'copy', '-fflags', '+genpts', dst], capture_output=True)
+                    if image_src:
+                        dur_p_vid = dur_vid
+                        dur_p_img = max(0.1, round(dur_real - dur_vid, 3))
+                        print(f"      🎬 Cena {i+1} ({id_cena}): Cena ({dur_real:.2f}s) > 140% do vídeo ({dur_vid:.2f}s) -> Vídeo ({dur_p_vid:.2f}s) + Imagem ({dur_p_img:.2f}s) | Vol: {int(volume*100)}%")
+                        p1 = os.path.join(tmp_dir, f"c_{i:04d}_p1.mp4")
+                        p2 = os.path.join(tmp_dir, f"c_{i:04d}_p2.mp4")
+                        renderiza_trecho_visual(
+                            src=video_src, dur=dur_p_vid, dst_path=p1,
+                            fit=fit, efeito='none', filtro=filtro, filtro_int=filtro_int,
+                            transicao=transicao, trans_dur=trans_dur, slow_factor=1.0,
+                            volume=volume
+                        )
+                        renderiza_trecho_visual(
+                            src=image_src, dur=dur_p_img, dst_path=p2,
+                            fit=fit, efeito=efeito, filtro=filtro, filtro_int=filtro_int,
+                            transicao='none', trans_dur=trans_dur, slow_factor=1.0,
+                            volume=0.0
+                        )
+                        cmd_concat = [
+                            'ffmpeg', '-y',
+                            '-i', p1, '-i', p2,
+                            '-filter_complex', '[0:v][1:v]concat=n=2:v=1:a=0[v];[0:a][1:a]concat=n=2:v=0:a=1[a]',
+                            '-map', '[v]', '-map', '[a]',
+                            '-c:v', 'libx264', '-preset', 'fast',
+                            '-pix_fmt', 'yuv420p', '-r', str(FPS),
+                            '-c:a', 'aac', '-ar', '48000', '-ac', '2',
+                            dst
+                        ]
+                        subprocess.run(cmd_concat, capture_output=True)
+                    else:
+                        print(f"      🎬 Cena {i+1} ({id_cena}): Vídeo ({dur_vid:.2f}s) estendido com freeze do último frame ({dur_real:.2f}s) | Vol: {int(volume*100)}%")
+                        dur_freeze = max(0.1, round(dur_real - dur_vid, 3))
+                        vf_freeze = f"setpts=PTS-STARTPTS,scale={RESOLUCAO[0]}:{RESOLUCAO[1]}:force_original_aspect_ratio=decrease,pad={RESOLUCAO[0]}:{RESOLUCAO[1]}:(ow-iw)/2:(oh-ih)/2:black,tpad=stop_mode=clone:stop_duration={dur_freeze:.3f},fps={FPS}"
+                        tem_som_valido = (volume > 0.001) and video_tem_audio(video_src)
+                        if tem_som_valido:
+                            cmd_freeze = [
+                                'ffmpeg', '-y', '-i', video_src, '-t', str(dur_real),
+                                '-vf', vf_freeze,
+                                '-af', f"volume={volume:.2f},apad=pad_dur={dur_freeze:.3f}",
+                                '-c:v', 'libx264', '-preset', 'fast',
+                                '-pix_fmt', 'yuv420p',
+                                '-c:a', 'aac', '-ar', '48000', '-ac', '2',
+                                dst
+                            ]
+                        else:
+                            cmd_freeze = [
+                                'ffmpeg', '-y',
+                                '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
+                                '-i', video_src, '-t', str(dur_real),
+                                '-vf', vf_freeze,
+                                '-c:v', 'libx264', '-preset', 'fast',
+                                '-pix_fmt', 'yuv420p',
+                                '-c:a', 'aac', '-ar', '48000', '-ac', '2',
+                                '-map', '1:v:0', '-map', '0:a:0',
+                                dst
+                            ]
+                        subprocess.run(cmd_freeze, capture_output=True)
             elif image_src:
-                renderiza_trecho_visual(image_src, dur_real, dst, fit, efeito, filtro, filtro_int, transicao, trans_dur, slow_factor=1.0)
+                print(f"      🖼️ Cena {i+1} ({id_cena}): Imagem ({os.path.basename(image_src)}) com duração {dur_real:.2f}s")
+                renderiza_trecho_visual(
+                    src=image_src, dur=dur_real, dst_path=dst,
+                    fit=fit, efeito=efeito, filtro=filtro, filtro_int=filtro_int,
+                    transicao=transicao, trans_dur=trans_dur, slow_factor=1.0,
+                    volume=0.0
+                )
             else:
-                subprocess.run(['ffmpeg', '-y', '-f', 'lavfi', '-i', f'color=black:size={RESOLUCAO[0]}x{RESOLUCAO[1]}:duration={dur_real}', '-r', str(FPS), dst], capture_output=True)
+                print(f"      ⚠️ Nenhuma mídia encontrada para cena {i+1} ({id_cena}) -> gerando fundo preto")
+                subprocess.run([
+                    'ffmpeg', '-y',
+                    '-f', 'lavfi', '-i', f'color=black:size={RESOLUCAO[0]}x{RESOLUCAO[1]}:duration={dur_real}',
+                    '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
+                    '-t', str(dur_real),
+                    '-r', str(FPS), '-pix_fmt', 'yuv420p',
+                    '-c:v', 'libx264', '-c:a', 'aac', '-ar', '48000', '-ac', '2',
+                    '-map', '0:v:0', '-map', '1:a:0',
+                    dst
+                ], capture_output=True)
 
             clips_processados.append({'path': dst, 'duration': dur_real})
 
@@ -645,18 +829,18 @@ def renderiza(instrucoes, pasta_projeto, audio_path,
             for clip in clips_processados:
                 f.write(f"file '{clip['path']}'\n")
 
-        video_sem_audio = os.path.join(tmp_dir, 'video_sem_audio.mp4')
+        video_com_som_ambiente = os.path.join(tmp_dir, 'video_com_som_ambiente.mp4')
         subprocess.run([
             'ffmpeg', '-y',
             '-f', 'concat', '-safe', '0',
             '-i', concat_list,
             '-c', 'copy',
             '-fflags', '+genpts',
-            video_sem_audio
+            video_com_som_ambiente
         ], capture_output=True)
 
         if pasta_job:
-            grava_status(pasta_job, "render", "Adicionando áudio e música...", 90)
+            grava_status(pasta_job, "render", "Mixando narração, efeitos e música...", 90)
 
         # Procura música de fundo (BGM) opcional (.mp3, .wav, .m4a, etc.)
         bgm_path = None
@@ -669,12 +853,12 @@ def renderiza(instrucoes, pasta_projeto, audio_path,
         if bgm_path and os.path.exists(bgm_path):
             cmd_audio = [
                 'ffmpeg', '-y',
-                '-i', video_sem_audio,
+                '-i', video_com_som_ambiente,
                 '-i', audio_path,
                 '-i', bgm_path,
-                '-filter_complex', '[1:a]volume=1.0[a1];[2:a]volume=0.2[a2];[a1][a2]amix=inputs=2:duration=first:dropout_transition=0[aout]',
+                '-filter_complex', '[0:a]volume=1.0[amb];[1:a]volume=1.0[voz];[2:a]volume=0.2[bgm];[voz][amb][bgm]amix=inputs=3:duration=first:dropout_transition=2[aout]',
                 '-c:v', 'copy',
-                '-c:a', 'aac',
+                '-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
                 '-shortest',
                 '-map', '0:v:0',
                 '-map', '[aout]',
@@ -683,13 +867,14 @@ def renderiza(instrucoes, pasta_projeto, audio_path,
         else:
             cmd_audio = [
                 'ffmpeg', '-y',
-                '-i', video_sem_audio,
+                '-i', video_com_som_ambiente,
                 '-i', audio_path,
+                '-filter_complex', '[0:a]volume=1.0[amb];[1:a]volume=1.0[voz];[voz][amb]amix=inputs=2:duration=first:dropout_transition=2[aout]',
                 '-c:v', 'copy',
-                '-c:a', 'aac',
+                '-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
                 '-shortest',
                 '-map', '0:v:0',
-                '-map', '1:a:0',
+                '-map', '[aout]',
                 saida_tmp
             ]
 

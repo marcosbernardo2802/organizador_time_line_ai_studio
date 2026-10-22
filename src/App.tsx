@@ -2,18 +2,12 @@ import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   ClipItem,
   MediaItem,
-  JobItem,
-  UserInfo,
-  FolderIds,
   AiFiles,
   AiStatus,
   RenderState,
   DragState,
 } from './types';
 import {
-  CLIENT_ID,
-  SCOPE,
-  MOTOR_ROOT,
   PPS,
   TRACKS,
   TRANSITION_CYCLE_POOL,
@@ -24,48 +18,34 @@ import {
   isAudioFile,
   isVideoFile,
   detectMediaType,
+  getMediaDuration,
+  mapInBatches,
+  validaRoteiroContraMidias,
 } from './utils/media';
-import { isInsideIframe, openInFloatingWindow } from './utils/window';
-import { driveApi } from './services/driveApi';
+import {
+  tocaSomConclusao,
+  pedePermissaoNotificacao,
+  notificaConclusao,
+} from './utils/notify';
 import { Header } from './components/Header';
 import { MediaLibrary } from './components/MediaLibrary';
 import { PreviewArea } from './components/PreviewArea';
 import { InspectorPanel } from './components/Inspector/InspectorPanel';
 import { Timeline } from './components/Timeline/Timeline';
 import { SendToMotorModal } from './components/Modals/SendToMotorModal';
-import { JobsModal } from './components/Modals/JobsModal';
 import { ExportModal } from './components/Modals/ExportModal';
-import { GoogleOAuthModal } from './components/Modals/GoogleOAuthModal';
 import { MotorNgrokModal } from './components/Modals/MotorNgrokModal';
-import { motorApi, MotorStatusInfo } from './services/motorApi';
+import { motorApi, MotorStatusInfo, FormatoRender, QualidadeRender } from './services/motorApi';
 import { localWorkspace } from './services/localWorkspace';
 
 export default function App() {
-  // Auth
-  const [authState, setAuthState] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle');
-  const [userInfo, setUserInfo] = useState<UserInfo | null>(null);
-  const [clientId, setClientId] = useState<string>(() => {
-    try {
-      return localStorage.getItem('cronicas_custom_client_id') || CLIENT_ID;
-    } catch {
-      return CLIENT_ID;
-    }
-  });
-  const tokenClientRef = useRef<any>(null);
-  const isInIframe = useRef(isInsideIframe()).current;
-  const [iframeOAuthWarning, setIframeOAuthWarning] = useState(false);
-
-  // Drive
-  const [driveReady, setDriveReady] = useState(false);
-  const [folderIds, setFolderIds] = useState<FolderIds>({});
-
   // Motor GPU (ngrok) & Workspace
   const [motorOnline, setMotorOnline] = useState<boolean>(false);
   const [motorGpu, setMotorGpu] = useState<string>('');
   const [workspaceName, setWorkspaceName] = useState<string | null>(() => localWorkspace.getActiveFolderName());
 
   // UI modais
-  const [modal, setModal] = useState<null | 'ai' | 'export' | 'jobs' | 'oauth' | 'motor'>(null);
+  const [modal, setModal] = useState<null | 'ai' | 'export' | 'motor'>(null);
 
   // IA / upload
   const [aiFiles, setAiFiles] = useState<AiFiles>({
@@ -75,10 +55,6 @@ export default function App() {
     bgm: null,
   });
   const [aiStatus, setAiStatus] = useState<AiStatus>({ step: '', msg: '', pct: 0, running: false, error: '' });
-
-  // Jobs no Drive
-  const [jobs, setJobs] = useState<JobItem[]>([]);
-  const pollRef = useRef<any>(null);
 
   // Timeline (editor)
   const [clips, setClips] = useState<ClipItem[]>([]);
@@ -181,325 +157,6 @@ export default function App() {
     }
   };
 
-  // ── GOOGLE LOGIN ────────────────────────────────────────────────────────────
-  // ── GOOGLE LOGIN & SYNC COM JANELA FLUTUANTE ─────────────────────────────
-  const onTokenAcquired = useCallback(async (accessToken: string) => {
-    driveApi.token = accessToken;
-    setAuthState('ok');
-    setIframeOAuthWarning(false);
-    try {
-      localStorage.setItem('cronicas_drive_token', accessToken);
-      if (window.opener && window.opener !== window) {
-        window.opener.postMessage({ type: 'CRONICAS_DRIVE_AUTH', token: accessToken }, '*');
-      }
-    } catch {}
-
-    try {
-      const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
-        headers: { Authorization: `Bearer ${accessToken}` },
-      });
-      if (r.ok) {
-        setUserInfo(await r.json());
-      }
-    } catch {}
-
-    await setupDriveFolders();
-  }, []);
-
-  const initGoogleAuth = useCallback(() => {
-    const gWindow = window as any;
-    if (!gWindow.google?.accounts?.oauth2) {
-      setTimeout(initGoogleAuth, 500);
-      return;
-    }
-    try {
-      tokenClientRef.current = gWindow.google.accounts.oauth2.initTokenClient({
-        client_id: clientId,
-        scope: SCOPE,
-        callback: async (resp: any) => {
-          if (resp.error) {
-            setAuthState('error');
-            if (isInIframe) {
-              setIframeOAuthWarning(true);
-            }
-            return;
-          }
-          await onTokenAcquired(resp.access_token);
-        },
-      });
-    } catch (e) {
-      console.warn('Google Auth Token Client não inicializado:', e);
-    }
-  }, [clientId, isInIframe, onTokenAcquired]);
-
-  useEffect(() => {
-    initGoogleAuth();
-  }, [initGoogleAuth]);
-
-  // Listener para sincronização automática quando o usuário faz login na janela flutuante
-  useEffect(() => {
-    const handleMsg = (e: MessageEvent) => {
-      if (e.data?.type === 'CRONICAS_DRIVE_AUTH' && e.data?.token) {
-        onTokenAcquired(e.data.token);
-      }
-    };
-    const handleStorage = (e: StorageEvent) => {
-      if (e.key === 'cronicas_drive_token' && e.newValue) {
-        onTokenAcquired(e.newValue);
-      }
-    };
-
-    window.addEventListener('message', handleMsg);
-    window.addEventListener('storage', handleStorage);
-
-    // Se já houver token salvo recentemente no localStorage, tenta restaurar a sessão
-    const savedToken = localStorage.getItem('cronicas_drive_token');
-    if (savedToken && !driveApi.token) {
-      onTokenAcquired(savedToken).catch(() => {
-        localStorage.removeItem('cronicas_drive_token');
-      });
-    }
-
-    return () => {
-      window.removeEventListener('message', handleMsg);
-      window.removeEventListener('storage', handleStorage);
-    };
-  }, [onTokenAcquired]);
-
-  // ── DRIVE: ESTRUTURA DE PASTAS ──────────────────────────────────────────────
-  const setupDriveFolders = async () => {
-    try {
-      const rootId = await driveApi.getRootId();
-      const motorId = await driveApi.getOrCreateFolder(rootId, MOTOR_ROOT);
-      const filaId = await driveApi.getOrCreateFolder(motorId, 'fila');
-      const concId = await driveApi.getOrCreateFolder(motorId, 'concluido');
-      const erroId = await driveApi.getOrCreateFolder(motorId, 'erro');
-      const procId = await driveApi.getOrCreateFolder(motorId, 'processando');
-      setFolderIds({ root: rootId, motor: motorId, fila: filaId, concluido: concId, erro: erroId, processando: procId });
-      setDriveReady(true);
-      startPolling(concId, erroId, procId, filaId);
-      if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
-        Notification.requestPermission();
-      }
-    } catch (e) {
-      console.error('Erro ao configurar pastas Drive:', e);
-    }
-  };
-
-  // ── POLLING: verifica jobs concluídos ───────────────────────────────────────
-  const startPolling = (concId: string, erroId: string, procId: string, filaId: string) => {
-    if (pollRef.current) clearInterval(pollRef.current);
-    pollRef.current = setInterval(async () => {
-      try {
-        const [conc, erro, proc, fila] = await Promise.all([
-          driveApi.listFolder(concId),
-          driveApi.listFolder(erroId),
-          driveApi.listFolder(procId),
-          driveApi.listFolder(filaId),
-        ]);
-        const novosJobs: JobItem[] = [
-          ...fila.map((j: any) => ({ ...j, status: 'fila' as const })),
-          ...proc.map((j: any) => ({ ...j, status: 'processando' as const })),
-          ...conc.map((j: any) => ({ ...j, status: 'concluido' as const })),
-          ...erro.map((j: any) => ({ ...j, status: 'erro' as const })),
-        ];
-
-        setJobs((prevJobs) => {
-          const prevConcluidos = new Set(prevJobs.filter((j) => j.status === 'concluido').map((j) => j.id));
-          const novosConcluidos = novosJobs.filter((j) => j.status === 'concluido' && !prevConcluidos.has(j.id));
-          if (novosConcluidos.length > 0) {
-            try {
-              const AudioCtx = (window as any).AudioContext || (window as any).webkitAudioContext;
-              const ctx = new AudioCtx();
-              [0, 150, 300].forEach((delay, i) => {
-                setTimeout(() => {
-                  const osc = ctx.createOscillator();
-                  const gain = ctx.createGain();
-                  osc.connect(gain);
-                  gain.connect(ctx.destination);
-                  osc.frequency.value = [880, 1100, 1320][i];
-                  gain.gain.setValueAtTime(0.3, ctx.currentTime);
-                  gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
-                  osc.start();
-                  osc.stop(ctx.currentTime + 0.3);
-                }, delay);
-              });
-            } catch {}
-            if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-              new Notification('✅ Motor de Dobra', { body: `Job concluído: ${novosConcluidos[0].name}` });
-            }
-          }
-          return novosJobs;
-        });
-      } catch {}
-    }, 12000);
-  };
-
-  useEffect(() => () => {
-    if (pollRef.current) clearInterval(pollRef.current);
-  }, []);
-
-  // ── ENVIAR JOB PARA O MOTOR ─────────────────────────────────────────────────
-  const autenticaSeNecessario = () =>
-    new Promise<void>((resolve, reject) => {
-      if (authState === 'ok' && driveApi.token) {
-        resolve();
-        return;
-      }
-      setAuthState('loading');
-      tokenClientRef.current?.requestAccessToken({
-        prompt: driveApi.token ? '' : 'consent',
-        callback: async (resp: any) => {
-          if (resp.error) {
-            setAuthState('error');
-            if (isInIframe) {
-              setIframeOAuthWarning(true);
-            }
-            reject(new Error('Falha no login'));
-            return;
-          }
-          await onTokenAcquired(resp.access_token);
-          resolve();
-        },
-      });
-    });
-
-  const enviaJob = async () => {
-    if (!aiFiles.audio || !aiFiles.roteiro || aiFiles.images.length === 0) return;
-    try {
-      await autenticaSeNecessario();
-    } catch {
-      return;
-    }
-    if (!driveReady || !folderIds.fila) return;
-
-    setAiStatus({ step: 'upload', msg: 'Criando pasta do job...', pct: 5, running: true, error: '' });
-
-    try {
-      const jobName = `job_${Date.now()}`;
-      const jobId = await driveApi.getOrCreateFolder(folderIds.fila, jobName);
-      setAiStatus((p) => ({ ...p, msg: `Pasta do job criada: ${jobName}`, pct: 10 }));
-
-      // Upload áudio
-      const audioExt = getFileExtension(aiFiles.audio.name) || 'mp3';
-      const audioFileName = `audio.${audioExt}`;
-      setAiStatus((p) => ({ ...p, msg: 'Enviando áudio...', pct: 15 }));
-      await driveApi.uploadFile(jobId, aiFiles.audio, audioFileName, (p) =>
-        setAiStatus((prev) => ({ ...prev, pct: 15 + p * 20 }))
-      );
-
-      // Upload roteiro
-      const rotExt = getFileExtension(aiFiles.roteiro.name) || 'txt';
-      const roteiroFileName = `roteiro.${rotExt}`;
-      setAiStatus((p) => ({ ...p, msg: 'Enviando roteiro...', pct: 36 }));
-      await driveApi.uploadFile(jobId, aiFiles.roteiro, roteiroFileName);
-
-      // Upload imagens e vídeos
-      for (let i = 0; i < aiFiles.images.length; i++) {
-        const visual = aiFiles.images[i];
-        const ext = getFileExtension(visual.name) || 'jpg';
-        const num = String(i + 1).padStart(4, '0');
-        setAiStatus((p) => ({
-          ...p,
-          msg: `Enviando mídia ${i + 1}/${aiFiles.images.length}...`,
-          pct: 38 + (i / aiFiles.images.length) * 40,
-        }));
-        await driveApi.uploadFile(jobId, visual, `${num}.${ext}`);
-      }
-
-      // Upload BGM se existir
-      let bgmFileName: string | null = null;
-      if (aiFiles.bgm) {
-        const bgmExt = getFileExtension(aiFiles.bgm.name) || 'mp3';
-        bgmFileName = `bgm.${bgmExt}`;
-        setAiStatus((p) => ({ ...p, msg: 'Enviando música de fundo...', pct: 80 }));
-        await driveApi.uploadFile(jobId, aiFiles.bgm, bgmFileName);
-      }
-
-      // Cria job.json
-      setAiStatus((p) => ({ ...p, msg: 'Criando instrução do job...', pct: 90 }));
-      const jobJson = {
-        tipo: 'timeline',
-        nome_projeto: jobName,
-        audio: audioFileName,
-        roteiro: roteiroFileName,
-        bgm: bgmFileName,
-        total_imagens: aiFiles.images.length,
-        total_midias: aiFiles.images.length,
-        criado_em: new Date().toISOString(),
-      };
-      await driveApi.uploadJson(jobId, 'job.json', jobJson);
-
-      const novasMedias: MediaItem[] = [];
-
-      for (let i = 0; i < aiFiles.images.length; i++) {
-        const f = aiFiles.images[i];
-        const url = URL.createObjectURL(f);
-        const id = `ai-media-${i}-${Date.now()}`;
-        fileCache.current[f.name] = f;
-        const isVid = isVideoFile(f.name, f.type);
-        let dur = 5;
-        if (isVid) {
-          dur = await new Promise<number>((res) => {
-            const v = document.createElement('video');
-            v.onloadedmetadata = () => res(v.duration || 5);
-            v.onerror = () => res(5);
-            v.src = url;
-          });
-        }
-        novasMedias.push({
-          id,
-          name: f.name,
-          type: f.type || (isVid ? 'video/mp4' : 'image/jpeg'),
-          url,
-          duration: dur,
-        });
-      }
-
-      if (aiFiles.audio) {
-        const f = aiFiles.audio;
-        const url = URL.createObjectURL(f);
-        const id = `ai-audio-${Date.now()}`;
-        fileCache.current[f.name] = f;
-        const dur = await new Promise<number>((res) => {
-          const a = document.createElement('audio');
-          a.onloadedmetadata = () => res(a.duration);
-          a.src = url;
-        });
-        novasMedias.push({ id, name: f.name, type: f.type, url, duration: dur });
-      }
-
-      if (aiFiles.bgm) {
-        const f = aiFiles.bgm;
-        const url = URL.createObjectURL(f);
-        const id = `ai-bgm-${Date.now()}`;
-        fileCache.current[f.name] = f;
-        novasMedias.push({ id, name: f.name, type: f.type, url, duration: 5 });
-      }
-
-      if (novasMedias.length > 0) {
-        setLibrary((prev) => {
-          const existentes = new Set(prev.map((m) => m.name.toLowerCase()));
-          const novas = novasMedias.filter((m) => !existentes.has(m.name.toLowerCase()));
-          return [...prev, ...novas];
-        });
-      }
-
-      setAiStatus({
-        step: 'aguardando',
-        msg: '✅ Job enviado! Arquivos adicionados à biblioteca. Aguardando o Motor processar...',
-        pct: 100,
-        running: false,
-        error: '',
-      });
-      setModal(null);
-      setAiFiles({ audio: null, roteiro: null, images: [], bgm: null });
-    } catch (e: any) {
-      console.error('Erro ao enviar job:', e);
-      alert(`Erro ao enviar job. Veja console para detalhes.\n${e.message}`);
-      setAiStatus({ step: 'erro', msg: '', pct: 0, running: false, error: `Erro: ${e.message}` });
-    }
-  };
 
   // ── MOTOR GPU (NGROK) STATUS CHECK ───────────────────────────────────────
   useEffect(() => {
@@ -527,32 +184,33 @@ export default function App() {
         bgm: null,
       });
 
-      const novasMedias: MediaItem[] = [];
-      for (let i = 0; i < res.mediaFiles.length; i++) {
-        const f = res.mediaFiles[i];
+      // Processa mídias visuais em lotes de até 6 itens lendo a duração real de vídeos (e 5s para imagens)
+      const novasMedias: MediaItem[] = await mapInBatches(res.mediaFiles, 6, async (f, i) => {
         const url = URL.createObjectURL(f);
         const id = `workspace-media-${i}-${Date.now()}`;
         fileCache.current[f.name] = f;
         const isVid = isVideoFile(f.name, f.type);
-        novasMedias.push({
+        const dur = isVid ? await getMediaDuration(f, 'video', 5) : 5;
+        return {
           id,
           name: f.name,
           type: f.type || (isVid ? 'video/mp4' : 'image/jpeg'),
           url,
-          duration: 5,
-        });
-      }
+          duration: dur,
+        };
+      });
 
       if (res.audioFile) {
         const f = res.audioFile;
         const url = URL.createObjectURL(f);
         fileCache.current[f.name] = f;
+        const dur = await getMediaDuration(f, 'audio', 60);
         novasMedias.push({
           id: `workspace-audio-${Date.now()}`,
           name: f.name,
           type: f.type || 'audio/mp3',
           url,
-          duration: 60,
+          duration: dur,
         });
       }
 
@@ -588,8 +246,23 @@ export default function App() {
     const extraLibrary: MediaItem[] = [];
 
     setLibrary((prevLib) => {
-      // Pega todas as mídias visuais disponíveis com URL válida
-      const visualMedias = prevLib.filter((m) => !isAudioFile(m.name, m.type) && m.url && !m.placeholder);
+      // Pega mídias visuais disponíveis com URL válida e DEDUP por nome base dando PREFERÊNCIA ao VÍDEO
+      const visualMap = new Map<string, MediaItem>();
+      const allVisuals = prevLib.filter((m) => !isAudioFile(m.name, m.type) && m.url && !m.placeholder);
+      allVisuals.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+
+      for (const m of allVisuals) {
+        const base = m.name.toLowerCase().replace(/\.[^/.]+$/, '');
+        const existing = visualMap.get(base);
+        if (!existing) {
+          visualMap.set(base, m);
+        } else if (!isVideoFile(existing.name, existing.type) && isVideoFile(m.name, m.type)) {
+          // Substitui a imagem pelo vídeo correspondente de mesmo nome
+          visualMap.set(base, m);
+        }
+      }
+
+      const visualMedias = Array.from(visualMap.values());
       visualMedias.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
 
       // Helper para priorizar vídeos sobre imagens quando houver mesmo nome base
@@ -605,6 +278,7 @@ export default function App() {
         const baseNome = arqNome.replace(/\.[^/.]+$/, '');
         const idStr = String(cena.id_cena || i + 1).toLowerCase().trim();
         const idSemZero = idStr.replace(/^0+/, '');
+        const idDigits = idStr.replace(/\D/g, '').replace(/^0+/, '') || '0';
 
         // 1. Busca por nome exato do arquivo (ex: '0001.mp4')
         let matched = visualMedias.find((m) => m.name.toLowerCase() === arqNome);
@@ -624,17 +298,18 @@ export default function App() {
           matched = matchVisualMedia((m) => m.name.toLowerCase().replace(/\.[^/.]+$/, '') === baseNome);
         }
 
-        // 3. Busca por id_cena contido no nome priorizando vídeo
-        if (!matched && idStr) {
+        // 3. Busca por id_cena contido no nome ou por dígitos normalizados priorizando vídeo
+        if (!matched && (idStr || idDigits)) {
           matched = matchVisualMedia((m) => {
             const b = m.name.toLowerCase().replace(/\.[^/.]+$/, '');
-            return b === idStr || b === idSemZero || b.includes(idStr) || Boolean(idSemZero && b.includes(idSemZero));
+            const bDigits = b.replace(/\D/g, '').replace(/^0+/, '') || '0';
+            return bDigits === idDigits || b === idStr || b === idSemZero || b.includes(idStr) || Boolean(idSemZero && b.includes(idSemZero));
           });
         }
 
-        // 4. Fallback sequencial inteligente: garante que TODAS as cenas tenham imagem/vídeo
-        if (!matched && visualMedias.length > 0) {
-          matched = visualMedias[i % visualMedias.length];
+        // 4. Fallback sequencial inteligente DIRETO (sem ciclar com %, para NUNCA duplicar 0001.mp4 no final!)
+        if (!matched && visualMedias.length > 0 && i < visualMedias.length) {
+          matched = visualMedias[i];
         }
 
         let mediaId: string;
@@ -653,12 +328,16 @@ export default function App() {
           });
         }
 
+        const startT = typeof cena.start === 'number' ? Number(cena.start) : Number(cena.startTime || 0);
+        const endT = typeof cena.end === 'number' ? Number(cena.end) : (startT + Number(cena.duration_real || cena.duration || 5));
+        const durT = Math.max(0.1, Number((endT - startT).toFixed(3)));
+
         newClips.push({
           id: `clip-${i}-${Date.now()}`,
           mediaId,
           trackId: 'video-1',
-          startTime: cena.start,
-          duration: cena.duration_real || cena.duration,
+          startTime: startT,
+          duration: durT,
           offset: 0,
           fit: 'contain',
           transition: 'none',
@@ -669,6 +348,7 @@ export default function App() {
           fadeIn: 0,
           fadeOut: 0,
           volume: 1.0,
+          score: typeof cena.score === 'number' && !isNaN(cena.score) ? Number(cena.score) : undefined,
         });
       });
 
@@ -690,6 +370,7 @@ export default function App() {
           fadeIn: 0,
           fadeOut: 0,
           volume: 1.0,
+          score: undefined,
         });
       }
 
@@ -705,37 +386,51 @@ export default function App() {
 
   // ── ENVIAR JOB DIRETO PARA O MOTOR (NGROK GPU) ───────────────────────────
   const enviaJobDireto = async () => {
+    // Solicita permissão para notificações do navegador em resposta ao clique do usuário
+    pedePermissaoNotificacao();
+
     if (!aiFiles.audio || !aiFiles.roteiro || aiFiles.images.length === 0) {
       alert('Selecione pelo menos uma narração (áudio), um roteiro (.txt) e imagens/vídeos.');
       return;
     }
 
-    // Garante que todas as mídias selecionadas estejam na biblioteca com URLs locais ativas
-    const mediasGarantidas: MediaItem[] = [];
+    // Validação prévia de roteiro contra mídias visuais antes de enviar ao motor
+    const validacao = await validaRoteiroContraMidias(aiFiles.roteiro, aiFiles.images);
+    if (validacao.avisos.length > 0) {
+      const msg = `Avisos de alinhamento antes do envio:\n\n• ${validacao.avisos.join('\n• ')}\n\nEnviar mesmo assim?`;
+      if (!confirm(msg)) {
+        return; // Aborta sem alterar aiStatus se o usuário cancelar
+      }
+    }
+
+    // Garante que todas as mídias selecionadas estejam na biblioteca com URLs locais ativas e durações reais
+    const mediasVisuais: MediaItem[] = await mapInBatches(aiFiles.images, 6, async (f, i) => {
+      fileCache.current[f.name] = f;
+      const url = URL.createObjectURL(f);
+      const isVid = isVideoFile(f.name, f.type);
+      const dur = isVid ? await getMediaDuration(f, 'video', 5) : 5;
+      return {
+        id: `local-media-${i}-${Date.now()}`,
+        name: f.name,
+        type: f.type || (isVid ? 'video/mp4' : 'image/jpeg'),
+        url,
+        duration: dur,
+      };
+    });
+
+    const mediasGarantidas: MediaItem[] = [...mediasVisuais];
+
     if (aiFiles.audio) {
       const f = aiFiles.audio;
       fileCache.current[f.name] = f;
       const url = URL.createObjectURL(f);
+      const dur = await getMediaDuration(f, 'audio', 60);
       mediasGarantidas.push({
         id: `local-audio-${Date.now()}`,
         name: f.name,
         type: f.type || 'audio/mp3',
         url,
-        duration: 60,
-      });
-    }
-
-    for (let i = 0; i < aiFiles.images.length; i++) {
-      const f = aiFiles.images[i];
-      fileCache.current[f.name] = f;
-      const url = URL.createObjectURL(f);
-      const isVid = isVideoFile(f.name, f.type);
-      mediasGarantidas.push({
-        id: `local-media-${i}-${Date.now()}`,
-        name: f.name,
-        type: f.type || (isVid ? 'video/mp4' : 'image/jpeg'),
-        url,
-        duration: 5,
+        duration: dur,
       });
     }
 
@@ -743,12 +438,13 @@ export default function App() {
       const f = aiFiles.bgm;
       fileCache.current[f.name] = f;
       const url = URL.createObjectURL(f);
+      const dur = await getMediaDuration(f, 'audio', 60);
       mediasGarantidas.push({
         id: `local-bgm-${Date.now()}`,
         name: f.name,
         type: f.type || 'audio/mp3',
         url,
-        duration: 60,
+        duration: dur,
       });
     }
 
@@ -770,12 +466,29 @@ export default function App() {
       const filesToSend: File[] = [aiFiles.audio, aiFiles.roteiro, ...aiFiles.images];
       if (aiFiles.bgm) filesToSend.push(aiFiles.bgm);
 
-      const res = await motorApi.enviarJob(filesToSend, 'timeline', (msg, pct) => {
-        setAiStatus((p) => ({ ...p, msg, pct, running: true, error: '' }));
+      const res = await motorApi.enviarJob(filesToSend, 'timeline', (msg, pct, status) => {
+        // A porcentagem nunca deve diminuir durante o job (Math.max)
+        setAiStatus((p) => ({
+          ...p,
+          msg,
+          pct: Math.max(p.pct, pct),
+          running: true,
+          error: '',
+          etapas: status?.etapas || p.etapas,
+          detalhe: status?.detalhe !== undefined ? (status.detalhe || undefined) : p.detalhe,
+          etapaIndice: status?.etapa_indice ?? p.etapaIndice,
+          etapaTotal: status?.etapa_total ?? p.etapaTotal,
+          etaSegundos: status?.eta_s !== undefined ? status.eta_s : p.etaSegundos,
+        }));
       });
 
       if (res.timeline) {
         aplicaTimelineNoEditor(res.timeline);
+        tocaSomConclusao();
+
+        const qtdCenas = res.timeline.cenas?.length || 0;
+        const roteiroNome = aiFiles.roteiro?.name ? ` para ${aiFiles.roteiro.name}` : '';
+        notificaConclusao('Timeline pronta', `${qtdCenas} cenas calculadas pela GPU${roteiroNome}`);
 
         if (localWorkspace.hasActiveHandle()) {
           await localWorkspace.saveFileToCurrentWorkspace('timeline.json', JSON.stringify(res.timeline, null, 2));
@@ -789,8 +502,19 @@ export default function App() {
           error: '',
         });
         setTimeout(() => setModal(null), 1200);
+      } else {
+        // O motor concluiu o job mas não retornou a timeline
+        notificaConclusao('Erro no Motor de Dobra', 'O motor concluiu o job, mas não devolveu a timeline.');
+        setAiStatus({
+          step: 'erro',
+          msg: '',
+          pct: 0,
+          running: false,
+          error: 'O motor concluiu o job, mas não devolveu a timeline. Verifique os logs do Colab e tente novamente.',
+        });
       }
     } catch (err: any) {
+      notificaConclusao('Erro no Motor de Dobra', err.message || 'Falha no processamento');
       setAiStatus({
         step: 'erro',
         msg: '',
@@ -798,23 +522,6 @@ export default function App() {
         running: false,
         error: `Erro no Motor de Dobra: ${err.message}`,
       });
-    }
-  };
-
-  // ── IMPORTAR TIMELINE.JSON DO DRIVE ────────────────────────────────────────
-  const importaTimeline = async (jobFolderId: string, _jobName: string) => {
-    try {
-      const files = await driveApi.listFolder(jobFolderId);
-      const tlFile = files.find((f: any) => f.name === 'timeline.json');
-      if (!tlFile) {
-        alert('timeline.json não encontrado nesse job.');
-        return;
-      }
-      const tl = await driveApi.readJson(tlFile.id);
-      aplicaTimelineNoEditor(tl);
-      alert(`✅ Timeline importada do Drive! ${tl.total_cenas} cenas | score: ${tl.score_medio}`);
-    } catch (e: any) {
-      alert('Erro ao importar timeline: ' + e.message);
     }
   };
 
@@ -933,6 +640,7 @@ export default function App() {
       fadeIn: 0,
       fadeOut: 0,
       volume: trackId === 'audio-2' ? 0.2 : 1.0,
+      score: undefined,
     };
     setClips((prev) => {
       const next = [...prev, clip];
@@ -1106,24 +814,39 @@ export default function App() {
     } else setPreviewSrc(null);
   }, [currentTime, clips, library]);
 
-  // ── SALVAR / CARREGAR PROJETO LOCAL ────────────────────────────────────────
+  // ── SALVAR / CARREGAR PROJETO LOCAL & AUTOSAVE ───────────────────────────
+  // Função auxiliar para estruturar o objeto do projeto (usada em salvamento manual e autosave)
+  const montaObjetoProjeto = (clipsArr: ClipItem[], libArr: MediaItem[], dur: number) => ({
+    versao: '3.0',
+    salvo_em: new Date().toISOString(),
+    duration: dur,
+    clips: clipsArr,
+    library: libArr.map((m) => ({
+      id: m.id,
+      name: m.name,
+      type: m.type,
+      duration: m.duration,
+      placeholder: true,
+    })),
+  });
+
+  // Refs para manter o estado atualizado no timer de autosave sem reiniciar o intervalo
+  const editorStateRef = useRef({ clips, library, duration });
+  editorStateRef.current = { clips, library, duration };
+
+  const houveAlteracaoAutosaveRef = useRef(false);
+
+  // Marca alteração sempre que clips, library ou duration mudarem
+  useEffect(() => {
+    houveAlteracaoAutosaveRef.current = true;
+  }, [clips, library, duration]);
+
   const salvaProjetoLocal = () => {
     try {
-      const projeto = {
-        versao: '3.0',
-        salvo_em: new Date().toISOString(),
-        duration,
-        clips,
-        library: library.map((m) => ({
-          id: m.id,
-          name: m.name,
-          type: m.type,
-          duration: m.duration,
-          placeholder: true,
-        })),
-      };
+      const projeto = montaObjetoProjeto(clips, library, duration);
       localStorage.setItem('cronicas_projeto', JSON.stringify(projeto));
       localStorage.setItem('cronicas_salvo_em', new Date().toLocaleString('pt-BR'));
+      setTemProjetoSalvo(true);
       alert('✅ Projeto salvo localmente!\nDa próxima vez clique em "Carregar Projeto" para restaurar a timeline.');
     } catch (e: any) {
       alert('Erro ao salvar: ' + e.message);
@@ -1181,84 +904,112 @@ export default function App() {
     setAiFiles({ audio: null, roteiro: null, images: [], bgm: null });
     localStorage.removeItem('cronicas_projeto');
     localStorage.removeItem('cronicas_salvo_em');
+    localStorage.removeItem('cronicas_autosave');
+    localStorage.removeItem('cronicas_autosave_em');
     setTemProjetoSalvo(false);
+    houveAlteracaoAutosaveRef.current = false;
   };
 
-  const handleLogout = () => {
-    setAuthState('idle');
-    setUserInfo(null);
-    driveApi.token = null;
+  // Limpeza de chaves legadas do Google Drive / OAuth do navegador
+  useEffect(() => {
     try {
       localStorage.removeItem('cronicas_drive_token');
+      localStorage.removeItem('cronicas_custom_client_id');
     } catch {}
-    setDriveReady(false);
-    setFolderIds({});
-    setJobs([]);
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-  };
+  }, []);
 
-  const handleOpenFloatingWindow = () => {
-    try {
-      if (clips.length > 0) {
-        const projeto = {
-          versao: '3.0',
-          salvo_em: new Date().toISOString(),
-          duration,
-          clips,
-          library: library.map((m) => ({ id: m.id, name: m.name, type: m.type, duration: m.duration, placeholder: true })),
-        };
-        localStorage.setItem('cronicas_projeto', JSON.stringify(projeto));
-        localStorage.setItem('cronicas_salvo_em', new Date().toLocaleString('pt-BR'));
-        setTemProjetoSalvo(true);
-      }
-    } catch (e) {
-      console.warn('Erro ao salvar projeto antes de abrir janela:', e);
-    }
-    openInFloatingWindow();
-  };
-
-  const handleSaveClientId = (newId: string) => {
-    const trimmed = newId.trim();
-    setClientId(trimmed || CLIENT_ID);
-    try {
-      if (trimmed && trimmed !== CLIENT_ID) {
-        localStorage.setItem('cronicas_custom_client_id', trimmed);
-      } else {
-        localStorage.removeItem('cronicas_custom_client_id');
-      }
-    } catch {}
-  };
-
-  const handleManualToken = async (manualToken: string) => {
-    await onTokenAcquired(manualToken);
-  };
-
+  // Verifica existência de projeto salvo manualmente para habilitar indicação no Header
   useEffect(() => {
     const raw = localStorage.getItem('cronicas_projeto');
     setTemProjetoSalvo(!!raw);
   }, []);
 
+  // Verificação inicial na abertura do app: restaura autosave se for mais recente que o salvamento manual
   useEffect(() => {
-    if (clips.length === 0) return;
-    const interval = setInterval(() => {
+    try {
+      const rawAutosave = localStorage.getItem('cronicas_autosave');
+      if (!rawAutosave) return;
+
+      let autosaveObj: any;
       try {
-        const projeto = {
-          versao: '3.0',
-          salvo_em: new Date().toISOString(),
-          duration,
-          clips,
-          library: library.map((m) => ({ id: m.id, name: m.name, type: m.type, duration: m.duration, placeholder: true })),
-        };
-        localStorage.setItem('cronicas_projeto', JSON.stringify(projeto));
-        localStorage.setItem('cronicas_salvo_em', new Date().toLocaleString('pt-BR'));
-        setTemProjetoSalvo(true);
-      } catch (e) {}
+        autosaveObj = JSON.parse(rawAutosave);
+      } catch {
+        localStorage.removeItem('cronicas_autosave');
+        localStorage.removeItem('cronicas_autosave_em');
+        return;
+      }
+
+      if (!autosaveObj || !Array.isArray(autosaveObj.clips) || autosaveObj.clips.length === 0) {
+        return;
+      }
+
+      // Compara a data salvo_em do autosave com a do projeto manual
+      const rawManual = localStorage.getItem('cronicas_projeto');
+      let autosaveMaisRecente = true;
+
+      if (rawManual) {
+        try {
+          const manualObj = JSON.parse(rawManual);
+          const timeAutosave = Date.parse(autosaveObj.salvo_em || '');
+          const timeManual = Date.parse(manualObj.salvo_em || '');
+
+          if (!isNaN(timeAutosave) && !isNaN(timeManual)) {
+            autosaveMaisRecente = timeAutosave > timeManual;
+          }
+        } catch {
+          autosaveMaisRecente = true;
+        }
+      }
+
+      if (autosaveMaisRecente) {
+        const dataStr =
+          localStorage.getItem('cronicas_autosave_em') ||
+          (autosaveObj.salvo_em ? new Date(autosaveObj.salvo_em).toLocaleString('pt-BR') : 'recente');
+
+        if (confirm(`Foi encontrado um autosave de ${dataStr}. Deseja restaurar?`)) {
+          setPast([]);
+          setFuture([]);
+          setClips(autosaveObj.clips || []);
+          setLibrary(autosaveObj.library || []);
+          setDuration(autosaveObj.duration || 60);
+          setCurrentTime(0);
+
+          const semUrl = (autosaveObj.library || []).filter((m: any) => m.placeholder).length;
+          if (semUrl > 0) {
+            alert(
+              `✅ Timeline restaurada do autosave! ${autosaveObj.clips?.length || 0} clips carregados.\n\n⚠️ ${semUrl} mídias precisam ser recarregadas.\nClique em "+" na biblioteca e selecione as imagens/áudio novamente — a timeline vai reconectá-los automaticamente pelo nome.`
+            );
+          }
+        } else {
+          // Se o usuário recusar, apaga as chaves do autosave para não perguntar novamente
+          localStorage.removeItem('cronicas_autosave');
+          localStorage.removeItem('cronicas_autosave_em');
+        }
+      }
+    } catch {
+      localStorage.removeItem('cronicas_autosave');
+      localStorage.removeItem('cronicas_autosave_em');
+    }
+  }, []);
+
+  // Efeito de autosave: executado a cada 2 minutos em chave própria ('cronicas_autosave') sem reiniciar intervalo
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const state = editorStateRef.current;
+      if (!houveAlteracaoAutosaveRef.current || state.clips.length === 0) return;
+
+      try {
+        const projeto = montaObjetoProjeto(state.clips, state.library, state.duration);
+        localStorage.setItem('cronicas_autosave', JSON.stringify(projeto));
+        localStorage.setItem('cronicas_autosave_em', new Date().toLocaleString('pt-BR'));
+        houveAlteracaoAutosaveRef.current = false;
+      } catch (err) {
+        console.warn('Aviso: falha ao gravar autosave no localStorage:', err);
+      }
     }, 2 * 60 * 1000);
+
     return () => clearInterval(interval);
-  }, [clips, library, duration]);
+  }, []);
 
   // ── ATALHOS DE TECLADO ──────────────────────────────────────────────────────
   useEffect(() => {
@@ -1405,9 +1156,9 @@ export default function App() {
         if (!matched && baseName) {
           matched = visualMedias.find((m) => m.name.toLowerCase().replace(/\.[^/.]+$/, '') === baseName);
         }
-        // 3. Fallback sequencial
-        if (!matched && visualMedias.length > 0) {
-          matched = visualMedias[visualIdx % visualMedias.length];
+        // 3. Fallback sequencial sem ciclar com %
+        if (!matched && visualMedias.length > 0 && visualIdx < visualMedias.length) {
+          matched = visualMedias[visualIdx];
         }
         visualIdx++;
 
@@ -1430,41 +1181,28 @@ export default function App() {
     }
     if (type === 'images') {
       const imgs = files.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-      const newLib: MediaItem[] = [];
-      for (let i = 0; i < imgs.length; i++) {
-        const f = imgs[i];
+      // Processa mídias visuais em lotes de até 6 itens lendo a duração real de vídeos (e 5s para imagens)
+      const newLib: MediaItem[] = await mapInBatches(imgs, 6, async (f, i) => {
         const url = URL.createObjectURL(f);
         const isVid = isVideoFile(f.name, f.type);
-        let dur = 5;
-        if (isVid) {
-          dur = await new Promise<number>((res) => {
-            const v = document.createElement('video');
-            v.onloadedmetadata = () => res(v.duration || 5);
-            v.onerror = () => res(5);
-            v.src = url;
-          });
-        }
-        newLib.push({
+        const dur = isVid ? await getMediaDuration(f, 'video', 5) : 5;
+        fileCache.current[f.name] = f;
+        return {
           id: `local-media-${i}-${Date.now()}`,
           name: f.name,
           type: f.type || (isVid ? 'video/mp4' : 'image/jpeg'),
           url,
           duration: dur,
-        });
-        fileCache.current[f.name] = f;
-      }
+        };
+      });
       setLibrary((prev) => [...prev, ...newLib]);
     }
     input.value = '';
   };
 
   const motorStatus = () => {
-    const proc = jobs.filter((j) => j.status === 'processando').length;
-    const fila = jobs.filter((j) => j.status === 'fila').length;
-    if (proc > 0) return { dot: 'working', label: `Processando ${proc} job(s)` };
-    if (fila > 0) return { dot: 'online', label: `${fila} job(s) na fila` };
-    if (driveReady) return { dot: 'online', label: 'Motor conectado' };
-    return { dot: 'offline', label: 'Desconectado' };
+    if (motorOnline) return { dot: 'working', label: `GPU Online ${motorGpu ? `(${motorGpu})` : ''}` };
+    return { dot: 'offline', label: 'Motor Desconectado' };
   };
 
   const mStatus = motorStatus();
@@ -1485,10 +1223,6 @@ export default function App() {
       <Header
         theme={theme}
         onToggleTheme={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
-        userInfo={userInfo}
-        authState={authState}
-        onAuth={() => autenticaSeNecessario().catch(() => {})}
-        onLogout={handleLogout}
         onNewProject={createNewProject}
         onLoadProject={carregaProjetoLocal}
         onSaveProject={salvaProjetoLocal}
@@ -1496,9 +1230,6 @@ export default function App() {
         onOpenAi={() => setModal('ai')}
         onOpenExport={() => setModal('export')}
         motorStatus={mStatus}
-        isInIframe={isInIframe}
-        onOpenFloatingWindow={handleOpenFloatingWindow}
-        onOpenOAuthHelp={() => setModal('oauth')}
         motorOnline={motorOnline}
         motorGpu={motorGpu}
         onOpenMotorConfig={() => setModal('motor')}
@@ -1591,6 +1322,7 @@ export default function App() {
                 fadeIn: 0,
                 fadeOut: 0,
                 volume: (trackId as string) === 'audio-2' ? 0.2 : 1.0,
+                score: undefined,
               },
             ]);
             if (lastEnd + m.duration > duration) setDuration(lastEnd + m.duration + 10);
@@ -1725,7 +1457,6 @@ export default function App() {
       <SendToMotorModal
         isOpen={modal === 'ai'}
         onClose={() => setModal(null)}
-        driveReady={driveReady}
         motorOnline={motorOnline}
         motorGpu={motorGpu}
         onOpenMotorConfig={() => setModal('motor')}
@@ -1734,21 +1465,7 @@ export default function App() {
         aiFiles={aiFiles}
         aiStatus={aiStatus}
         onFileChange={handleFiles}
-        onSubmitJob={enviaJob}
         onSubmitDirectJob={enviaJobDireto}
-        isInIframe={isInIframe}
-        onOpenFloatingWindow={handleOpenFloatingWindow}
-        onOpenOAuthHelp={() => setModal('oauth')}
-      />
-
-      <JobsModal
-        isOpen={modal === 'jobs'}
-        onClose={() => setModal(null)}
-        jobs={jobs}
-        onImportTimeline={(jobId, jobName) => {
-          importaTimeline(jobId, jobName);
-          setModal(null);
-        }}
       />
 
       <ExportModal
@@ -1765,7 +1482,7 @@ export default function App() {
           a.download = 'projeto_cronicas.json';
           a.click();
         }}
-        onRenderColab={async () => {
+        onRenderColab={async (opcoes: { formato: FormatoRender; qualidade: QualidadeRender }) => {
           const videoClips = clips
             .filter((c) => c.trackId === 'video-1')
             .sort((a, b) => a.startTime - b.startTime);
@@ -1824,6 +1541,7 @@ export default function App() {
                     effect: clip.effect || 'none',
                     filter: clip.filter || 'none',
                     filter_intensity: clip.filterIntensity ?? 100,
+                    volume: typeof clip.volume === 'number' ? clip.volume : 0.0,
                   };
                 }),
                 audio: narMedia.name,
@@ -1911,31 +1629,61 @@ export default function App() {
                 }
               }
 
-              const res = await motorApi.enviarJob(filesToSend, 'render', (msg, pct) => {
-                setRenderState({ isRendering: true, progress: pct, status: msg });
-              });
+              // Envia job ao motor Colab com opções de formato e qualidade
+              const res = await motorApi.enviarJob(
+                filesToSend,
+                'render',
+                (msg, pct, status) => {
+                  // A porcentagem nunca deve diminuir durante a renderização (Math.max)
+                  setRenderState((p) => ({
+                    ...p,
+                    isRendering: true,
+                    progress: Math.max(p.progress, pct),
+                    status: msg,
+                    etapas: status?.etapas || p.etapas,
+                    detalhe: status?.detalhe !== undefined ? (status.detalhe || undefined) : p.detalhe,
+                    etapaIndice: status?.etapa_indice ?? p.etapaIndice,
+                    etapaTotal: status?.etapa_total ?? p.etapaTotal,
+                    etaSegundos: status?.eta_s !== undefined ? status.eta_s : p.etaSegundos,
+                  }));
+                },
+                opcoes
+              );
 
               if (res.videoBlob) {
+                // Nome do arquivo com sufixo de qualidade e formato (ex.: video_1080p_16x9.mp4)
+                const formatoSlug = opcoes.formato.replace(':', 'x');
+                const nomeArquivo = `video_${opcoes.qualidade}_${formatoSlug}.mp4`;
+
                 const url = URL.createObjectURL(res.videoBlob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = 'video_final.mp4';
+                a.download = nomeArquivo;
                 a.click();
 
                 if (localWorkspace.hasActiveHandle()) {
-                  await localWorkspace.saveFileToCurrentWorkspace('video_final.mp4', res.videoBlob);
+                  await localWorkspace.saveFileToCurrentWorkspace(nomeArquivo, res.videoBlob);
                 }
 
-                setRenderState({ isRendering: false, progress: 100, status: '✅ Vídeo renderizado pela GPU com sucesso! O download foi iniciado.' });
+                // Notificação sonora e do navegador ao concluir renderização com sucesso
+                tocaSomConclusao();
+                notificaConclusao('Vídeo renderizado', 'O vídeo está pronto para download.');
+
+                setRenderState({
+                  isRendering: false,
+                  progress: 100,
+                  status: `✅ Vídeo (${opcoes.formato} ${opcoes.qualidade}) renderizado pela GPU com sucesso! O download foi iniciado.`,
+                });
               }
             } catch (err: any) {
+              notificaConclusao('Erro na renderização', err.message || 'Falha ao renderizar vídeo na GPU.');
               setRenderState({ isRendering: false, progress: 0, status: `Erro na GPU: ${err.message}` });
               alert(`Erro na renderização da GPU: ${err.message}`);
             }
             return;
           }
 
-          // Se o motor ngrok não estiver conectado, solicita a conexão sem disparar OAuth
+          // Se o motor ngrok não estiver conectado, solicita a conexão
           setModal('motor');
           alert('Por favor, conecte o Motor de Dobra (Colab GPU) com a URL do túnel ngrok para renderizar o vídeo.');
           return;
@@ -1951,39 +1699,38 @@ export default function App() {
 
           setRenderState({ isRendering: true, progress: 0, status: 'Carregando FFmpeg...' });
           let ffmpeg: any = null;
+          const blobUrlsToRevoke: string[] = [];
+          const filesToDelete: string[] = [];
+
           try {
-            // @ts-ignore
-            const ffmpegModule = await import(/* @vite-ignore */ 'https://esm.sh/@ffmpeg/ffmpeg@0.12.10');
-            const { createFFmpeg } = ffmpegModule;
-            const base = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
-            const fb = 'https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/esm';
-
-            setRenderState((p) => ({ ...p, status: 'Baixando motor FFmpeg...' }));
-            const [coreURL, wasmURL] = await Promise.all([
-              fetch(`${base}/ffmpeg-core.js`)
-                .then((r) => r.blob())
-                .then((b) => URL.createObjectURL(b)),
-              fetch(`${base}/ffmpeg-core.wasm`)
-                .then((r) => r.blob())
-                .then((b) => URL.createObjectURL(b)),
+            const [{ FFmpeg }, { fetchFile, toBlobURL }] = await Promise.all([
+              import('@ffmpeg/ffmpeg'),
+              import('@ffmpeg/util'),
             ]);
-            const workerText = await fetch(`${fb}/worker.js`).then((r) => r.text());
-            const workerURL = URL.createObjectURL(new Blob([workerText], { type: 'text/javascript' }));
 
-            ffmpeg = createFFmpeg({ log: false, coreURL, wasmURL, workerURL });
-            await ffmpeg.load();
+            ffmpeg = new FFmpeg();
 
             ffmpeg.on('log', ({ message }: { message: string }) => {
-              const m = message.match(/time=(\d{2}):(\d{2}):(\d{2})/);
-              if (m) {
-                const t = parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseInt(m[3]);
-                setRenderState((p) => ({
-                  ...p,
-                  progress: Math.min(99, Math.round((t / duration) * 100)),
-                  status: `Renderizando: ${Math.min(99, Math.round((t / duration) * 100))}%`,
-                }));
-              }
+              console.debug('[FFmpeg]', message);
             });
+
+            ffmpeg.on('progress', ({ progress }: { progress: number }) => {
+              const p = Math.max(0, Math.min(1, progress));
+              const pct = Math.min(99, Math.round(p * 100));
+              setRenderState((prev) => ({
+                ...prev,
+                progress: pct,
+                status: `Renderizando: ${pct}%`,
+              }));
+            });
+
+            setRenderState((p) => ({ ...p, status: 'Baixando motor FFmpeg...' }));
+            const base = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm';
+            const coreURL = await toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript');
+            const wasmURL = await toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm');
+            blobUrlsToRevoke.push(coreURL, wasmURL);
+
+            await ffmpeg.load({ coreURL, wasmURL });
 
             let listTxt = '';
             for (let i = 0; i < videoClips.length; i++) {
@@ -1994,8 +1741,9 @@ export default function App() {
               const ext = getFileExtension(media.name) || 'jpg';
               const fname = `img${i}.${ext}`;
               const cached = fileCache.current[media.name];
-              const buf = cached ? await cached.arrayBuffer() : await fetch(media.url).then((r) => r.arrayBuffer());
-              await ffmpeg.writeFile(fname, new Uint8Array(buf));
+              const buf = cached ? await fetchFile(cached) : await fetchFile(media.url);
+              await ffmpeg.writeFile(fname, buf);
+              filesToDelete.push(fname);
               const next = videoClips[i + 1];
               const dur = next ? next.startTime - clip.startTime : duration - clip.startTime;
               listTxt += `file '${fname}'\nduration ${Math.max(0.1, dur).toFixed(3)}\n`;
@@ -2007,6 +1755,7 @@ export default function App() {
               listTxt += `file 'img${videoClips.length - 1}.${ext}'\n`;
             }
             await ffmpeg.writeFile('list.txt', new TextEncoder().encode(listTxt));
+            filesToDelete.push('list.txt');
 
             let cmd = ['-f', 'concat', '-safe', '0', '-i', 'list.txt'];
             let filterParts: string[] = [];
@@ -2015,8 +1764,9 @@ export default function App() {
               const narMedia = library.find((m) => m.id === narClip.mediaId);
               if (narMedia) {
                 const cached = fileCache.current[narMedia.name];
-                const buf = cached ? await cached.arrayBuffer() : await fetch(narMedia.url!).then((r) => r.arrayBuffer());
-                await ffmpeg.writeFile('narration.mp3', new Uint8Array(buf));
+                const buf = cached ? await fetchFile(cached) : await fetchFile(narMedia.url!);
+                await ffmpeg.writeFile('narration.mp3', buf);
+                filesToDelete.push('narration.mp3');
                 cmd.push('-i', 'narration.mp3');
                 filterParts.push(`[1:a]volume=${getClipVolume(narClip, 1.0).toFixed(3)}[a1]`);
               }
@@ -2026,8 +1776,9 @@ export default function App() {
               const bgmMedia = library.find((m) => m.id === bgmClip.mediaId);
               if (bgmMedia) {
                 const cached = fileCache.current[bgmMedia.name];
-                const buf = cached ? await cached.arrayBuffer() : await fetch(bgmMedia.url!).then((r) => r.arrayBuffer());
-                await ffmpeg.writeFile('bgm.mp3', new Uint8Array(buf));
+                const buf = cached ? await fetchFile(cached) : await fetchFile(bgmMedia.url!);
+                await ffmpeg.writeFile('bgm.mp3', buf);
+                filesToDelete.push('bgm.mp3');
                 cmd.push('-i', 'bgm.mp3');
                 const bgmInputIndex = narClip ? 2 : 1;
                 filterParts.push(`[${bgmInputIndex}:a]volume=${getClipVolume(bgmClip, 0.2).toFixed(3)}[bgm]`);
@@ -2056,12 +1807,18 @@ export default function App() {
               );
             }
             cmd.push('saida.mp4');
+            filesToDelete.push('saida.mp4');
 
             setRenderState((p) => ({ ...p, status: 'Renderizando vídeo...' }));
-            await ffmpeg.exec(cmd);
+            const exitCode = await ffmpeg.exec(cmd);
+            if (exitCode !== 0) {
+              throw new Error(`FFmpeg falhou com código de saída ${exitCode}`);
+            }
 
             const data = await ffmpeg.readFile('saida.mp4');
-            const url = URL.createObjectURL(new Blob([data.buffer], { type: 'video/mp4' }));
+            const dataBuffer = (data as Uint8Array).buffer ? (data as Uint8Array).buffer : data;
+            const url = URL.createObjectURL(new Blob([dataBuffer as ArrayBuffer], { type: 'video/mp4' }));
+            blobUrlsToRevoke.push(url);
             const a = document.createElement('a');
             a.href = url;
             a.download = 'cronicas_estelares.mp4';
@@ -2070,22 +1827,27 @@ export default function App() {
             setRenderState({ isRendering: false, progress: 100, status: '✅ Download iniciado!' });
             setTimeout(() => setModal(null), 2000);
           } catch (e: any) {
-            setRenderState({ isRendering: false, progress: 0, status: `Erro: ${e.message}` });
+            const errorMsg = e?.message || String(e) || 'Erro desconhecido na renderização';
+            setRenderState({ isRendering: false, progress: 0, status: `Erro: ${errorMsg}` });
+            alert(`Erro na renderização no navegador: ${errorMsg}`);
           } finally {
-            try {
-              ffmpeg?.terminate();
-            } catch {}
+            if (ffmpeg) {
+              for (const f of filesToDelete) {
+                try {
+                  await ffmpeg.deleteFile(f);
+                } catch {}
+              }
+              try {
+                ffmpeg.terminate();
+              } catch {}
+            }
+            for (const url of blobUrlsToRevoke) {
+              try {
+                URL.revokeObjectURL(url);
+              } catch {}
+            }
           }
         }}
-      />
-
-      <GoogleOAuthModal
-        isOpen={modal === 'oauth'}
-        onClose={() => setModal(null)}
-        currentClientId={clientId}
-        onSaveClientId={handleSaveClientId}
-        onManualToken={handleManualToken}
-        onRetryAuth={() => autenticaSeNecessario().catch(() => {})}
       />
 
       <MotorNgrokModal
@@ -2162,10 +1924,21 @@ export default function App() {
                 overflow: 'hidden',
                 textOverflow: 'ellipsis',
                 whiteSpace: 'nowrap',
-                maxWidth: 240,
+                maxWidth: 270,
               }}
+              title={
+                renderState.etapaIndice && renderState.etapaTotal
+                  ? `${renderState.status} · Etapa ${renderState.etapaIndice}/${renderState.etapaTotal}${renderState.detalhe ? ` · ${renderState.detalhe}` : ''}`
+                  : renderState.status
+              }
             >
               {renderState.status}
+              {renderState.etapaIndice && renderState.etapaTotal && (
+                <span style={{ color: '#94a3b8', marginLeft: 4 }}>
+                  · Etapa {renderState.etapaIndice}/{renderState.etapaTotal}
+                  {renderState.detalhe ? ` · ${renderState.detalhe}` : ''}
+                </span>
+              )}
             </span>
             <strong style={{ color: '#00f0ff', marginLeft: 8 }}>{renderState.progress}%</strong>
           </div>

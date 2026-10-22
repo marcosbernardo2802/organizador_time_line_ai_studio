@@ -38,10 +38,17 @@ export const TimelineClip: React.FC<TimelineClipProps> = ({
     ? 'rgba(0,200,117,0.5)'
     : 'var(--accent)';
 
+  const hasScore = !isAudio && typeof clip.score === 'number' && !isNaN(clip.score);
+  const scoreVal = hasScore ? (clip.score! > 1 ? clip.score! / 100 : clip.score!) : 0;
+  const scorePct = Math.round(scoreVal * 100);
+  const scoreColor = scoreVal >= 0.8 ? '#10b981' : scoreVal >= 0.6 ? '#f59e0b' : '#ef4444';
+  const scoreTooltip = `Confiança do alinhamento: ${scorePct}%`;
+
   return (
     <div
       onMouseDown={(e) => onClipMouseDown(e, clip.id, 'move')}
       onClick={(e) => e.stopPropagation()}
+      title={hasScore ? scoreTooltip : undefined}
       style={{
         position: 'absolute',
         top: 3,
@@ -186,6 +193,44 @@ export const TimelineClip: React.FC<TimelineClipProps> = ({
           }}
           title={`Transição: ${clip.transition}`}
         />
+      )}
+
+      {/* Indicador de Confiança do Alinhamento (Score) */}
+      {hasScore && (
+        <div
+          title={scoreTooltip}
+          style={{
+            position: 'absolute',
+            top: 3,
+            right: clip.transition && clip.transition !== 'none' ? 16 : 14,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 3,
+            padding: '1px 5px',
+            borderRadius: 3,
+            background: 'rgba(0, 0, 0, 0.7)',
+            border: `1px solid ${scoreColor}`,
+            fontSize: 9,
+            fontWeight: 700,
+            fontFamily: 'Rajdhani, sans-serif',
+            color: scoreColor,
+            lineHeight: 1,
+            pointerEvents: 'none',
+            zIndex: 4,
+            boxShadow: `0 0 4px ${scoreColor}40`,
+          }}
+        >
+          <span
+            style={{
+              width: 5,
+              height: 5,
+              borderRadius: '50%',
+              background: scoreColor,
+              display: 'inline-block',
+            }}
+          />
+          <span>{scorePct}%</span>
+        </div>
       )}
 
       {/* Resize right handle */}

@@ -1,5 +1,5 @@
 import React from 'react';
-import { ClipItem, MediaItem } from '../types';
+import { ClipItem, MediaItem, FormatoRender } from '../types';
 import { fmt } from '../utils/format';
 import { isVideoFile, isAudioFile } from '../utils/media';
 
@@ -12,6 +12,7 @@ interface PreviewAreaProps {
   activeClip: ClipItem | undefined;
   library: MediaItem[];
   isPlaying?: boolean;
+  formato?: FormatoRender;
 }
 
 export const PreviewArea: React.FC<PreviewAreaProps> = ({
@@ -23,6 +24,7 @@ export const PreviewArea: React.FC<PreviewAreaProps> = ({
   activeClip,
   library,
   isPlaying = false,
+  formato = '16:9',
 }) => {
   const videoRef = React.useRef<HTMLVideoElement | null>(null);
   const isSeekingRef = React.useRef(false);
@@ -180,9 +182,14 @@ export const PreviewArea: React.FC<PreviewAreaProps> = ({
         <div
           style={{
             position: 'relative',
-            aspectRatio: '16 / 9',
+            aspectRatio: formato === '9:16' ? '9 / 16' : formato === '1:1' ? '1 / 1' : '16 / 9',
             width: '100cqw',
-            maxWidth: 'calc(100cqh * 16 / 9)',
+            maxWidth:
+              formato === '9:16'
+                ? 'calc(100cqh * 9 / 16)'
+                : formato === '1:1'
+                ? '100cqh'
+                : 'calc(100cqh * 16 / 9)',
             maxHeight: '100cqh',
             background: '#000',
             border: fullscreen ? 'none' : '1px solid var(--border)',
@@ -194,8 +201,31 @@ export const PreviewArea: React.FC<PreviewAreaProps> = ({
             borderRadius: fullscreen ? '0px' : '4px',
             overflow: 'hidden',
             flexShrink: 0,
+            transition: 'aspect-ratio 0.25s ease, max-width 0.25s ease',
           }}
         >
+          {/* Indicador de formato no topo esquerdo do monitor */}
+          <div
+            className="mono"
+            style={{
+              position: 'absolute',
+              top: 10,
+              left: 12,
+              background: 'rgba(0, 0, 0, 0.65)',
+              backdropFilter: 'blur(4px)',
+              border: '1px solid rgba(255, 255, 255, 0.1)',
+              padding: '2px 6px',
+              fontSize: 10,
+              fontWeight: 700,
+              color: '#00f0ff',
+              borderRadius: 3,
+              zIndex: 10,
+              letterSpacing: 0.5,
+            }}
+            title={`Formato de exibição: ${formato}`}
+          >
+            {formato}
+          </div>
           <div
             className={
               activeClip?.filter === 'grain'

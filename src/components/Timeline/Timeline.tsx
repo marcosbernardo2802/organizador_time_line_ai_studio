@@ -1,5 +1,5 @@
 import React from 'react';
-import { ClipItem, MediaItem, Track } from '../../types';
+import { ClipItem, MediaItem, Track, FormatoRender, QualidadeRender, FpsOpcao } from '../../types';
 import { PPS } from '../../constants';
 import { TimelineControls } from './TimelineControls';
 import { TimelineClip } from './TimelineClip';
@@ -18,6 +18,14 @@ interface TimelineProps {
   canRedo: boolean;
   isPlaying: boolean;
   snapOn: boolean;
+  showWaveform: boolean;
+  onToggleWaveform: () => void;
+  formato: FormatoRender;
+  onChangeFormato: (f: FormatoRender) => void;
+  fps: FpsOpcao;
+  onChangeFps: (fps: FpsOpcao) => void;
+  qualidade: QualidadeRender;
+  onChangeQualidade: (q: QualidadeRender) => void;
   onUndo: () => void;
   onRedo: () => void;
   onStop: () => void;
@@ -48,6 +56,14 @@ export const Timeline: React.FC<TimelineProps> = ({
   canRedo,
   isPlaying,
   snapOn,
+  showWaveform,
+  onToggleWaveform,
+  formato,
+  onChangeFormato,
+  fps,
+  onChangeFps,
+  qualidade,
+  onChangeQualidade,
   onUndo,
   onRedo,
   onStop,
@@ -63,6 +79,9 @@ export const Timeline: React.FC<TimelineProps> = ({
   onTimelineDrop,
   onClipMouseDown,
 }) => {
+  // Mapa de mídias para busca O(1) sem percorrer a biblioteca inteira para cada clip
+  const libraryMap = React.useMemo(() => new Map(library.map((m) => [m.id, m])), [library]);
+
   return (
     <div
       style={{
@@ -74,14 +93,23 @@ export const Timeline: React.FC<TimelineProps> = ({
         flexShrink: 0,
       }}
     >
-      {/* Controles de navegação, histórico e zoom */}
+      {/* Controles de navegação, histórico, formato/fps/resolução e zoom */}
       <TimelineControls
         canUndo={canUndo}
         canRedo={canRedo}
         isPlaying={isPlaying}
         snapOn={snapOn}
         zoom={zoom}
+        theme={theme}
+        showWaveform={showWaveform}
+        onToggleWaveform={onToggleWaveform}
         hasSelectedClip={Boolean(selectedId)}
+        formato={formato}
+        onChangeFormato={onChangeFormato}
+        fps={fps}
+        onChangeFps={onChangeFps}
+        qualidade={qualidade}
+        onChangeQualidade={onChangeQualidade}
         onUndo={onUndo}
         onRedo={onRedo}
         onStop={onStop}
@@ -115,6 +143,7 @@ export const Timeline: React.FC<TimelineProps> = ({
 
         {/* Área de Clips da Timeline */}
         <div
+          data-timeline-scroll
           style={{ flex: 1, overflowX: 'auto', position: 'relative', userSelect: 'none' }}
           ref={timelineRef}
           onClick={onTimelineClick}
@@ -159,7 +188,7 @@ export const Timeline: React.FC<TimelineProps> = ({
                   .map((clip) => {
                     const isSelected = clip.id === selectedId;
                     const isAudio = track.type === 'audio';
-                    const clipMedia = library.find((m) => m.id === clip.mediaId);
+                    const clipMedia = libraryMap.get(clip.mediaId);
 
                     return (
                       <TimelineClip
@@ -170,6 +199,7 @@ export const Timeline: React.FC<TimelineProps> = ({
                         isAudio={isAudio}
                         zoom={zoom}
                         theme={theme}
+                        showWaveform={showWaveform}
                         onClipMouseDown={onClipMouseDown}
                       />
                     );

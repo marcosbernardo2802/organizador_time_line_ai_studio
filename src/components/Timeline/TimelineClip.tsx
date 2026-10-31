@@ -1,7 +1,10 @@
-import React from 'react';
+import React, { useRef, useState, useEffect } from 'react';
 import { ClipItem, MediaItem } from '../../types';
 import { PPS } from '../../constants';
 import { isVideoFile } from '../../utils/media';
+import { useThumbnail } from '../../utils/thumbnails';
+import { Waveform } from './Waveform';
+import { useWaveform, geraWaveformManual } from '../../utils/waveform';
 
 interface TimelineClipProps {
   clip: ClipItem;
@@ -10,18 +13,72 @@ interface TimelineClipProps {
   isAudio: boolean;
   zoom: number;
   theme: string;
+  showWaveform?: boolean;
   onClipMouseDown: (e: React.MouseEvent, clipId: string, type: string) => void;
 }
 
-export const TimelineClip: React.FC<TimelineClipProps> = ({
+const TimelineClipComponent: React.FC<TimelineClipProps> = ({
   clip,
   media,
   isSelected,
   isAudio,
   zoom,
   theme,
+  showWaveform = false,
   onClipMouseDown,
 }) => {
+  // Observação de visibilidade no viewport/scroll com rootMargin de 200px
+  const clipRef = useRef<HTMLDivElement | null>(null);
+  const [isVisible, setIsVisible] = useState(false);
+
+  useEffect(() => {
+    const el = clipRef.current;
+    if (!el || typeof IntersectionObserver === 'undefined') {
+      setIsVisible(true);
+      return;
+    }
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        if (entry) {
+          setIsVisible(entry.isIntersecting);
+        }
+      },
+      { rootMargin: '200px' }
+    );
+    observer.observe(el);
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
+  const clipWidthPx = clip.duration * PPS * zoom;
+  const isVideo = !isAudio && Boolean(media?.url) && isVideoFile(media!.name, media!.type);
+  const tipoMidia: 'video' | 'imagem' = isVideo ? 'video' : 'imagem';
+  const temMidiaElegivel = !isAudio && Boolean(media?.url) && !media?.placeholder;
+  const isAtivo = temMidiaElegivel && isVisible && clipWidthPx >= 48;
+
+  // Hook de miniatura chamado incondicionalmente no topo
+  const { estado: thumbEstado, thumbUrl } = useThumbnail(
+    temMidiaElegivel ? media?.url : null,
+    tipoMidia,
+    isAtivo
+  );
+
+  const isAudioEligivel = isAudio && Boolean(media?.url) && !media?.placeholder;
+
+  // Hook da forma de onda real para clips de áudio elegíveis (apenas quando ativado pelo usuário)
+  const {
+    estado: waveEstado,
+    picos: wavePicos,
+    picosPorSegundo: wavePps,
+    bytes: waveBytes,
+  } = useWaveform(
+    isAudioEligivel && showWaveform ? media?.url : null,
+    media?.duration,
+    Boolean(showWaveform)
+  );
+
   const bgColor = isSelected
     ? isAudio
       ? 'rgba(0,200,117,0.4)'
@@ -46,6 +103,7 @@ export const TimelineClip: React.FC<TimelineClipProps> = ({
 
   return (
     <div
+      ref={clipRef}
       onMouseDown={(e) => onClipMouseDown(e, clip.id, 'move')}
       onClick={(e) => e.stopPropagation()}
       title={hasScore ? scoreTooltip : undefined}
@@ -106,34 +164,76 @@ export const TimelineClip: React.FC<TimelineClipProps> = ({
           padding: '0 14px',
         }}
       >
-        {isAudio && (
+        {/* Forma de onda real do áudio via Canvas virtualizado (quando ativada) */}
+        {isAudio && showWaveform && (
+          <Waveform
+            picos={wavePicos}
+            picosPorSegundo={wavePps}
+            estado={waveEstado}
+            bytes={waveBytes}
+            clipLeftPx={clip.startTime * PPS * zoom}
+            clipWidthPx={clip.duration * PPS * zoom}
+            offsetSeg={clip.offset || 0}
+            pxPorSeg={PPS * zoom}
+            selecionado={isSelected}
+            onGerarManual={() => {
+              if (media?.url) {
+                geraWaveformManual(media.url, media.duration);
+              }
+            }}
+          />
+        )}
+
+        {/* Forma de onda leve / fallback (barras decorativas sem decodificação de áudio) */}
+        {isAudio && !showWaveform && (
           <div
             style={{
               position: 'absolute',
               inset: 0,
               display: 'flex',
               alignItems: 'center',
-              gap: 1,
-              padding: '2px 4px',
+              gap: 2,
+              padding: '0 8px',
               opacity: 0.4,
+              pointerEvents: 'none',
+              overflow: 'hidden',
             }}
           >
-            {Array.from({ length: Math.min(80, Math.floor((clip.duration * PPS * zoom) / 4)) }).map((_, i) => (
+            {Array.from({ length: 80 }).map((_, i) => (
               <div
                 key={i}
                 style={{
                   width: 2,
-                  flexShrink: 0,
-                  height: `${20 + Math.sin(i * 0.8) * 15 + Math.sin(i * 2.1) * 10 + Math.random() * 5}%`,
-                  background: isSelected ? '#00c875' : 'rgba(0,200,117,0.8)',
+                  height: `${Math.max(15, Math.abs(Math.sin((i + 1) * 0.45)) * 75 + 10)}%`,
+                  background: '#00c875',
                   borderRadius: 1,
+                  flexShrink: 0,
                 }}
               />
             ))}
           </div>
         )}
 
-        {!isAudio && media?.url && isVideoFile(media.name, media.type) && (
+        {/* Miniatura renderizada com Blob JPEG redimensionado */}
+        {!isAudio && temMidiaElegivel && thumbEstado === 'pronta' && thumbUrl && (
+          <img
+            src={thumbUrl}
+            alt=""
+            draggable={false}
+            style={{
+              height: '100%',
+              width: 'auto',
+              maxWidth: 64,
+              objectFit: 'cover',
+              opacity: 0.9,
+              flexShrink: 0,
+              pointerEvents: 'none',
+            }}
+          />
+        )}
+
+        {/* Ícone reserva de vídeo enquanto miniatura carrega ou se falhar */}
+        {!isAudio && isVideo && (!thumbUrl || thumbEstado !== 'pronta') && (
           <div
             style={{
               height: '100%',
@@ -149,14 +249,6 @@ export const TimelineClip: React.FC<TimelineClipProps> = ({
           >
             🎬
           </div>
-        )}
-
-        {!isAudio && media?.url && !isVideoFile(media.name, media.type) && (
-          <img
-            src={media.url}
-            alt=""
-            style={{ height: '100%', width: 'auto', maxWidth: 40, objectFit: 'cover', opacity: 0.8, flexShrink: 0 }}
-          />
         )}
 
         <span
@@ -265,3 +357,7 @@ export const TimelineClip: React.FC<TimelineClipProps> = ({
     </div>
   );
 };
+
+// Memoização para evitar re-renderizar centenas de clips a cada frame durante playback
+export const TimelineClip = React.memo(TimelineClipComponent);
+

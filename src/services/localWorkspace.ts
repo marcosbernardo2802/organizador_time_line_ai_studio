@@ -14,9 +14,9 @@ export interface WorkspaceFiles {
 
 let activeDirectoryHandle: any = null;
 
-const EXT_AUDIO = ['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac'];
-const EXT_SCRIPT = ['.txt', '.md', '.text'];
-const EXT_VISUAL = ['.jpg', '.jpeg', '.png', '.webp', '.mp4', '.mov', '.webm', '.avi', '.mkv'];
+const EXT_AUDIO = ['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac', '.wma', '.opus', '.aiff', '.aif'];
+const EXT_SCRIPT = ['.txt', '.md', '.text', '.srt'];
+const EXT_VISUAL = ['.jpg', '.jpeg', '.png', '.webp', '.mp4', '.mov', '.webm', '.avi', '.mkv', '.m4v', '.gif', '.bmp', '.tiff'];
 
 function getExt(name: string): string {
   const parts = name.split('.');
@@ -40,13 +40,26 @@ export const localWorkspace = {
       activeDirectoryHandle = handle;
       const folderName = handle.name || 'Pasta de Trabalho';
 
+      // Leitura recursiva de arquivos para suportar subpastas (ex: imagens/, videos/, cenas/)
       const files: File[] = [];
-      for await (const entry of handle.values()) {
-        if (entry.kind === 'file') {
-          const file = await entry.getFile();
-          files.push(file);
+      async function lerDiretorio(dirHandle: any, profundidade = 0) {
+        if (profundidade > 3) return;
+        for await (const entry of dirHandle.values()) {
+          if (entry.kind === 'file') {
+            try {
+              const file = await entry.getFile();
+              files.push(file);
+            } catch {}
+          } else if (entry.kind === 'directory') {
+            const nome = entry.name.toLowerCase();
+            if (!['node_modules', '.git', '.vscode', '__pycache__', 'dist', 'build'].includes(nome)) {
+              await lerDiretorio(entry, profundidade + 1);
+            }
+          }
         }
       }
+
+      await lerDiretorio(handle, 0);
 
       return this.organizeFiles(folderName, files, true);
     } catch (err: any) {
@@ -71,7 +84,7 @@ export const localWorkspace = {
         timelineFile = f;
       } else if (EXT_AUDIO.includes(ext) && !lower.startsWith('bgm.')) {
         if (!audioFile) audioFile = f;
-      } else if (EXT_SCRIPT.includes(ext) || lower.includes('roteiro')) {
+      } else if (EXT_SCRIPT.includes(ext) || lower.includes('roteiro') || lower.includes('script')) {
         if (!scriptFile) scriptFile = f;
       } else if (EXT_VISUAL.includes(ext)) {
         mediaFiles.push(f);

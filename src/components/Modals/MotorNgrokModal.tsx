@@ -5,13 +5,17 @@ interface MotorNgrokModalProps {
   isOpen: boolean;
   onClose: () => void;
   onConnected?: (info: MotorStatusInfo) => void;
+  theme?: string;
 }
 
 export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
   isOpen,
   onClose,
   onConnected,
+  theme = 'dark',
 }) => {
+  const isLight = theme === 'light' || (typeof document !== 'undefined' && document.documentElement.getAttribute('data-theme') === 'light');
+
   const [url, setUrl] = useState('');
   const [testing, setTesting] = useState(false);
   const [statusInfo, setStatusInfo] = useState<MotorStatusInfo | null>(null);
@@ -72,7 +76,7 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
       style={{
         position: 'fixed',
         inset: 0,
-        backgroundColor: 'rgba(5, 7, 12, 0.85)',
+        backgroundColor: isLight ? 'rgba(15, 23, 42, 0.5)' : 'rgba(5, 7, 12, 0.85)',
         backdropFilter: 'blur(6px)',
         display: 'flex',
         alignItems: 'center',
@@ -86,14 +90,14 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
     >
       <div
         style={{
-          background: '#0d131f',
-          border: '1px solid #1f293d',
-          boxShadow: '0 0 35px rgba(0, 240, 255, 0.15)',
+          background: isLight ? '#ffffff' : '#0d131f',
+          border: isLight ? '1px solid #cbd5e1' : '1px solid #1f293d',
+          boxShadow: isLight ? '0 10px 25px rgba(0, 0, 0, 0.15)' : '0 0 35px rgba(0, 240, 255, 0.15)',
           borderRadius: 14,
           width: '100%',
           maxWidth: 580,
           padding: 24,
-          color: '#e2e8f0',
+          color: isLight ? '#0f172a' : '#e2e8f0',
           fontFamily: 'sans-serif',
         }}
       >
@@ -102,10 +106,10 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <span style={{ fontSize: 24 }}>⚡</span>
             <div>
-              <h3 style={{ margin: 0, fontSize: 17, fontWeight: 700, color: '#00f0ff', letterSpacing: '0.5px' }}>
+              <h3 style={{ margin: 0, fontSize: 17, fontWeight: 700, color: isLight ? '#0284c7' : '#00f0ff', letterSpacing: '0.5px' }}>
                 Conectar Motor de Dobra 4.2 (Colab GPU)
               </h3>
-              <p style={{ margin: 0, fontSize: 12, color: '#8899aa' }}>
+              <p style={{ margin: 0, fontSize: 12, color: isLight ? '#475569' : '#8899aa', fontWeight: isLight ? 500 : 400 }}>
                 Conexão direta via túnel ngrok • Processamento em tempo real na GPU
               </p>
             </div>
@@ -115,7 +119,7 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
             style={{
               background: 'transparent',
               border: 'none',
-              color: '#8899aa',
+              color: isLight ? '#64748b' : '#8899aa',
               fontSize: 20,
               cursor: 'pointer',
               padding: 4,
@@ -127,7 +131,7 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
 
         {/* Input da URL */}
         <div style={{ marginBottom: 16 }}>
-          <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: '#94a3b8', marginBottom: 6 }}>
+          <label style={{ display: 'block', fontSize: 12, fontWeight: 600, color: isLight ? '#334155' : '#94a3b8', marginBottom: 6 }}>
             URL Pública gerada no Google Colab (ngrok):
           </label>
           <div style={{ display: 'flex', gap: 8 }}>
@@ -138,11 +142,12 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
               onChange={(e) => setUrl(e.target.value)}
               style={{
                 flex: 1,
-                background: '#070a10',
-                border: '1px solid #334155',
+                background: isLight ? '#f8fafc' : '#070a10',
+                border: isLight ? '1px solid #94a3b8' : '1px solid #334155',
                 borderRadius: 8,
                 padding: '10px 12px',
-                color: '#38bdf8',
+                color: isLight ? '#0369a1' : '#38bdf8',
+                fontWeight: isLight ? 600 : 400,
                 fontSize: 13,
                 fontFamily: 'monospace',
                 outline: 'none',
@@ -152,18 +157,19 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
               onClick={() => testUrl(url)}
               disabled={testing || !url.trim()}
               style={{
-                background: '#1e293b',
-                color: '#38bdf8',
-                border: '1px solid #38bdf8',
+                background: isLight ? '#ffffff' : '#1e293b',
+                color: isLight ? '#0284c7' : '#38bdf8',
+                border: isLight ? '1px solid #0284c7' : '1px solid #38bdf8',
                 borderRadius: 8,
                 padding: '0 16px',
                 fontSize: 13,
-                fontWeight: 600,
+                fontWeight: 700,
                 cursor: testing || !url.trim() ? 'not-allowed' : 'pointer',
                 opacity: testing || !url.trim() ? 0.5 : 1,
                 display: 'flex',
                 alignItems: 'center',
                 gap: 6,
+                boxShadow: isLight ? '0 1px 2px rgba(0,0,0,0.05)' : undefined,
               }}
             >
               {testing ? 'Testando...' : '🔍 Testar'}
@@ -175,8 +181,10 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
         {statusInfo && (
           <div
             style={{
-              background: statusInfo.online ? 'rgba(34, 197, 94, 0.1)' : 'rgba(239, 68, 68, 0.1)',
-              border: `1px solid ${statusInfo.online ? '#22c55e' : '#ef4444'}`,
+              background: statusInfo.online
+                ? (isLight ? '#f0fdf4' : 'rgba(34, 197, 94, 0.1)')
+                : (isLight ? '#fef2f2' : 'rgba(239, 68, 68, 0.1)'),
+              border: `1px solid ${statusInfo.online ? (isLight ? '#86efac' : '#22c55e') : (isLight ? '#fca5a5' : '#ef4444')}`,
               borderRadius: 8,
               padding: '12px 14px',
               marginBottom: 18,
@@ -189,23 +197,25 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
                   width: 10,
                   height: 10,
                   borderRadius: '50%',
-                  backgroundColor: statusInfo.online ? '#22c55e' : '#ef4444',
-                  boxShadow: statusInfo.online ? '0 0 8px #22c55e' : 'none',
+                  backgroundColor: statusInfo.online
+                    ? (isLight ? '#16a34a' : '#22c55e')
+                    : (isLight ? '#dc2626' : '#ef4444'),
+                  boxShadow: statusInfo.online ? (isLight ? '0 0 4px #16a34a' : '0 0 8px #22c55e') : 'none',
                 }}
               />
-              <strong style={{ color: statusInfo.online ? '#22c55e' : '#ef4444' }}>
+              <strong style={{ color: statusInfo.online ? (isLight ? '#166534' : '#22c55e') : (isLight ? '#991b1b' : '#ef4444') }}>
                 {statusInfo.online ? 'Motor Online e Pronto!' : 'Falha ao Conectar'}
               </strong>
             </div>
 
             {statusInfo.online ? (
-              <div style={{ fontSize: 12, color: '#cbd5e1', marginTop: 4, display: 'flex', gap: 16 }}>
+              <div style={{ fontSize: 12, color: isLight ? '#1e293b' : '#cbd5e1', marginTop: 4, display: 'flex', gap: 16, fontWeight: isLight ? 500 : 400 }}>
                 <div>🚀 <strong>GPU:</strong> {statusInfo.gpu}</div>
                 <div>🧠 <strong>Whisper:</strong> {statusInfo.whisper_model}</div>
                 <div>⚡ <strong>Modo:</strong> Direto (sem Drive)</div>
               </div>
             ) : (
-              <div style={{ fontSize: 12, color: '#fca5a5', marginTop: 4 }}>
+              <div style={{ fontSize: 12, color: isLight ? '#7f1d1d' : '#fca5a5', marginTop: 4, fontWeight: isLight ? 500 : 400, lineHeight: 1.4 }}>
                 {statusInfo.error}
               </div>
             )}
@@ -215,17 +225,17 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
         {/* Instruções Rápidas */}
         <div
           style={{
-            background: '#090e18',
-            border: '1px dashed #223049',
+            background: isLight ? '#f8fafc' : '#090e18',
+            border: isLight ? '1px dashed #cbd5e1' : '1px dashed #223049',
             borderRadius: 8,
             padding: 12,
             fontSize: 12,
-            color: '#829ab1',
+            color: isLight ? '#334155' : '#829ab1',
             lineHeight: 1.5,
             marginBottom: 20,
           }}
         >
-          <strong style={{ color: '#00f0ff' }}>💡 Como obter o link:</strong>
+          <strong style={{ color: isLight ? '#0284c7' : '#00f0ff' }}>💡 Como obter o link:</strong>
           <ol style={{ margin: '6px 0 0', paddingLeft: 18 }}>
             <li>No seu Google Colab, execute a célula do <code>motor_de_dobra_ngrok.py</code>.</li>
             <li>Clique no botão <strong>"Copiar URL"</strong> que aparece no card do Colab.</li>
@@ -238,12 +248,13 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
           <button
             onClick={onClose}
             style={{
-              background: '#1a2233',
-              border: '1px solid #334155',
-              color: '#94a3b8',
+              background: isLight ? '#ffffff' : '#1a2233',
+              border: isLight ? '1px solid #cbd5e1' : '1px solid #334155',
+              color: isLight ? '#334155' : '#94a3b8',
               borderRadius: 6,
               padding: '8px 16px',
               fontSize: 13,
+              fontWeight: isLight ? 600 : 400,
               cursor: 'pointer',
             }}
           >
@@ -253,9 +264,11 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
             onClick={handleSave}
             disabled={!url.trim()}
             style={{
-              background: saveSuccess ? '#22c55e' : '#00f0ff',
+              background: saveSuccess
+                ? (isLight ? '#16a34a' : '#22c55e')
+                : (isLight ? '#0284c7' : '#00f0ff'),
               border: 'none',
-              color: '#060d17',
+              color: '#ffffff',
               borderRadius: 6,
               padding: '8px 20px',
               fontSize: 13,
@@ -263,6 +276,7 @@ export const MotorNgrokModal: React.FC<MotorNgrokModalProps> = ({
               cursor: !url.trim() ? 'not-allowed' : 'pointer',
               opacity: !url.trim() ? 0.5 : 1,
               transition: 'all 0.2s ease',
+              boxShadow: isLight ? '0 1px 3px rgba(0,0,0,0.1)' : undefined,
             }}
           >
             {saveSuccess ? '✅ Salvo!' : 'Salvar Conexão'}

@@ -20,6 +20,7 @@ PORTA_LOCAL = 8000  # @param {type:"integer"}
 WHISPER_MODEL = "medium"  # @param ["tiny", "base", "small", "medium", "large-v3"]
 RESOLUCAO_ESCOLHIDA = "1080p (1920x1080)"  # @param ["1080p (1920x1080)", "720p (1280x720)", "4K (3840x2160)"]
 FPS = 24  # @param {type:"integer"}
+USAR_CACHE_TRANSCRICAO = True  # @param {type:"boolean"}
 
 # ==============================================================================
 # 1. INSTALAÇÃO DAS DEPENDÊNCIAS
@@ -33,7 +34,7 @@ subprocess.run([
     "openai-whisper", "moviepy", "tqdm", "-q"
 ], check=True)
 
-import os, re, unicodedata, whisper, threading, time, json, shutil, tempfile, uuid
+import os, re, unicodedata, whisper, threading, time, json, shutil, tempfile, uuid, hashlib
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import List, Optional
@@ -60,16 +61,22 @@ PERFIS_RESOLUCAO = {
         "480p": (854, 480),
         "720p": (1280, 720),
         "1080p": (1920, 1080),
+        "1440p": (2560, 1440),
+        "2160p": (3840, 2160),
     },
     "9:16": {
         "480p": (480, 854),
         "720p": (720, 1280),
         "1080p": (1080, 1920),
+        "1440p": (1440, 2560),
+        "2160p": (2160, 3840),
     },
     "1:1": {
         "480p": (480, 480),
         "720p": (720, 720),
         "1080p": (1080, 1080),
+        "1440p": (1440, 1440),
+        "2160p": (2160, 2160),
     },
 }
 
@@ -79,7 +86,7 @@ def resolve_perfil(formato: str = "", qualidade: str = "") -> dict:
     Preserva a constante global RESOLUCAO e preset fast caso nenhum perfil seja informado.
     """
     f = (formato or "").strip()
-    q = (qualidade or "").strip()
+    q = (qualidade or "").strip().lower()
     if not f and not q:
         return {"resolucao": RESOLUCAO, "preset": "fast", "crf": None}
 
@@ -87,6 +94,12 @@ def resolve_perfil(formato: str = "", qualidade: str = "") -> dict:
         f = "16:9"
     if not q:
         q = "1080p"
+
+    # Mapeamento de aliases amigáveis para 2k e 4k
+    if q in ("2k", "1440", "1440p"):
+        q = "1440p"
+    elif q in ("4k", "2160", "2160p"):
+        q = "2160p"
 
     if f not in PERFIS_RESOLUCAO or q not in PERFIS_RESOLUCAO[f]:
         raise ValueError(f"Perfil de render inválido: formato '{formato}', qualidade '{qualidade}'")
@@ -137,6 +150,108 @@ PLANOS_ETAPAS = {
 # Pastas locais temporárias no SSD rápido do Colab (não usam Google Drive)
 PASTA_JOBS = "/content/motor_jobs"
 os.makedirs(PASTA_JOBS, exist_ok=True)
+
+# Configurações do cache de transcrição do Whisper por hash de áudio
+PASTA_CACHE = "/content/motor_cache"
+os.makedirs(PASTA_CACHE, exist_ok=True)
+CACHE_VERSAO = 1
+CACHE_MAX_ENTRADAS = 100
+
+def hash_arquivo(caminho: str) -> str:
+    """Calcula hash SHA-256 de um arquivo lendo em blocos de 1 MiB."""
+    h = hashlib.sha256()
+    with open(caminho, 'rb') as f:
+        while True:
+            bloco = f.read(1024 * 1024)
+            if not bloco:
+                break
+            h.update(bloco)
+    return h.hexdigest()
+
+def chave_cache(hash_audio: str) -> str:
+    """Gera chave hex única de cache combinando hash do áudio, modelo, idioma e versão."""
+    versao_whisper = getattr(whisper, '__version__', '?')
+    raw = f"{hash_audio}|{WHISPER_MODEL}|pt|{versao_whisper}|v{CACHE_VERSAO}"
+    return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+def le_cache(chave: str):
+    """Lê entrada do cache; valida palavras e duração, removendo arquivos corrompidos."""
+    p = os.path.join(PASTA_CACHE, f"{chave}.json")
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, 'r', encoding='utf-8') as f:
+            dados = json.load(f)
+        palavras = dados.get("palavras")
+        duracao = dados.get("duracao")
+        if not isinstance(palavras, list) or len(palavras) == 0:
+            os.remove(p)
+            return None
+        if not isinstance(duracao, (int, float)):
+            os.remove(p)
+            return None
+        for item in palavras:
+            if not isinstance(item, dict) or 'word' not in item or 'start' not in item or 'end' not in item:
+                os.remove(p)
+                return None
+        return dados
+    except Exception:
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except Exception:
+            pass
+        return None
+
+def poda_cache():
+    """Remove os arquivos de cache mais antigos caso exceda CACHE_MAX_ENTRADAS."""
+    try:
+        arquivos = [
+            os.path.join(PASTA_CACHE, f)
+            for f in os.listdir(PASTA_CACHE)
+            if f.endswith('.json')
+        ]
+        if len(arquivos) > CACHE_MAX_ENTRADAS:
+            arquivos.sort(key=lambda x: os.path.getmtime(x))
+            remover = len(arquivos) - CACHE_MAX_ENTRADAS
+            for arq in arquivos[:remover]:
+                try:
+                    os.remove(arq)
+                except Exception:
+                    pass
+    except Exception as e:
+        print(f"⚠️ Aviso ao podar cache do Whisper: {e}")
+
+def grava_cache(chave: str, palavras: list, duracao: float, audio_nome: str, audio_hash: str):
+    """Grava resultado da transcrição atomicamente usando arquivo temporário e os.replace."""
+    if not palavras:
+        return
+    try:
+        palavras_convertidas = []
+        for p in palavras:
+            palavras_convertidas.append({
+                "word": str(p.get("word", "")),
+                "start": float(p.get("start", 0.0)),
+                "end": float(p.get("end", 0.0)),
+            })
+        conteudo = {
+            "versao": CACHE_VERSAO,
+            "criado_em": datetime.now().isoformat(),
+            "modelo": WHISPER_MODEL,
+            "idioma": "pt",
+            "audio_nome": audio_nome,
+            "audio_hash": audio_hash,
+            "duracao": float(duracao),
+            "palavras": palavras_convertidas,
+        }
+        destino = os.path.join(PASTA_CACHE, f"{chave}.json")
+        fd, tmp_path = tempfile.mkstemp(prefix="cache_", suffix=".tmp", dir=PASTA_CACHE)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(conteudo, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, destino)
+        poda_cache()
+    except Exception as e:
+        print(f"⚠️ Aviso ao gravar cache de transcrição: {e}")
 
 # ==============================================================================
 # KEEP-ALIVE ANTI-DESCONEXÃO DO GOOGLE COLAB
@@ -303,12 +418,44 @@ def get_whisper():
             _whisper_cache = whisper.load_model(WHISPER_MODEL, device=device)
     return _whisper_cache
 
-def transcreve_audio(audio_path: str, cb_status=None):
+def transcreve_audio(audio_path: str, cb_status=None, ignorar_cache: bool = False):
+    is_progresso = hasattr(cb_status, "inicia_etapa")
+    audio_hash = None
+    chave = None
+
+    # 1. Consulta inicial ao cache ANTES de carregar modelo e antes do lock (economiza GPU e tempo)
+    if USAR_CACHE_TRANSCRICAO:
+        audio_hash = hash_arquivo(audio_path)
+        chave = chave_cache(audio_hash)
+
+        if not ignorar_cache:
+            hit = le_cache(chave)
+            if hit:
+                print(f"💾 Cache de transcrição: HIT ({chave[:8]})")
+                if is_progresso:
+                    cb_status.inicia_etapa("transcricao", detalhe="Transcrição reaproveitada do cache")
+                    cb_status.fracao(1.0, "Transcrição reaproveitada do cache")
+                elif cb_status:
+                    cb_status("whisper", "Transcrição reaproveitada do cache", 100)
+                return hit["palavras"], hit["duracao"]
+            else:
+                print(f"💾 Cache de transcrição: MISS ({chave[:8]})")
+
     with _whisper_lock:
-        is_progresso = hasattr(cb_status, "inicia_etapa")
-        global _whisper_cache
+        # 2. Segunda consulta ao cache pós-lock (caso outro job tenha processado o mesmo áudio enquanto esperava)
+        if USAR_CACHE_TRANSCRICAO and not ignorar_cache and chave:
+            hit2 = le_cache(chave)
+            if hit2:
+                print(f"💾 Cache de transcrição: HIT ({chave[:8]})")
+                if is_progresso:
+                    cb_status.inicia_etapa("transcricao", detalhe="Transcrição reaproveitada do cache")
+                    cb_status.fracao(1.0, "Transcrição reaproveitada do cache")
+                elif cb_status:
+                    cb_status("whisper", "Transcrição reaproveitada do cache", 100)
+                return hit2["palavras"], hit2["duracao"]
 
         # Se o modelo ainda não estiver carregado na VRAM, sinaliza no detalhe
+        global _whisper_cache
         if _whisper_cache is None:
             if is_progresso:
                 cb_status.inicia_etapa("transcricao", detalhe="Carregando modelo Whisper...")
@@ -408,6 +555,11 @@ def transcreve_audio(audio_path: str, cb_status=None):
                     "end":   w['end'],
                 })
         duracao = result['segments'][-1]['end'] if result['segments'] else 0
+
+        # Grava no cache se o cache estiver ativo (inclusive quando ignorar_cache=True para sobrescrever)
+        if USAR_CACHE_TRANSCRICAO and chave:
+            grava_cache(chave, palavras, duracao, os.path.basename(audio_path), audio_hash)
+
         return palavras, duracao
 
 def normaliza_texto(texto: str):
@@ -621,7 +773,25 @@ def video_tem_audio(path: str) -> bool:
     except Exception:
         return False
 
-def renderiza_trecho_visual(src, dur, dst_path, fit='contain', efeito='none', filtro='none', filtro_int=100, transicao='none', trans_dur=0.8, slow_factor=1.0, volume=0.0, resolucao=RESOLUCAO, preset="fast", crf=None):
+def roda_ffmpeg(cmd, descricao: str):
+    """
+    Executa comando FFmpeg verificando returncode e integridade do arquivo gerado.
+    Lança RuntimeError com os últimos 800 caracteres do stderr se houver falha.
+    """
+    res = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
+    if res.returncode != 0:
+        stderr_tail = (res.stderr or "").strip()[-800:]
+        raise RuntimeError(f"ffmpeg falhou em {descricao}: {stderr_tail}")
+
+    # Se o comando tiver um arquivo de saída conhecido (último argumento), confere existência e tamanho
+    saida = cmd[-1] if isinstance(cmd, (list, tuple)) and cmd and isinstance(cmd[-1], str) and not cmd[-1].startswith('-') else None
+    if saida:
+        if not os.path.exists(saida) or os.path.getsize(saida) == 0:
+            stderr_tail = (res.stderr or "").strip()[-800:]
+            msg_extra = f": {stderr_tail}" if stderr_tail else ""
+            raise RuntimeError(f"ffmpeg falhou em {descricao}: arquivo de saída não foi gerado ou está vazio ({saida}){msg_extra}")
+
+def renderiza_trecho_visual(src, dur, dst_path, fit='contain', efeito='none', filtro='none', filtro_int=100, transicao='none', trans_dur=0.8, slow_factor=1.0, volume=0.0, resolucao=RESOLUCAO, preset="fast", crf=None, fps=FPS):
     """
     Renderiza um trecho visual individual (vídeo ou imagem) com FFmpeg padronizado na resolução final.
     Suporta escala, slow motion suave via setpts, efeitos de câmera, filtros e áudio sincronizado com volume individual.
@@ -644,15 +814,15 @@ def renderiza_trecho_visual(src, dur, dst_path, fit='contain', efeito='none', fi
 
     # 3. Efeitos de movimento de câmera em imagens
     if not is_vid:
-        nb_frames = max(1, int(dur * FPS))
+        nb_frames = max(1, int(dur * fps))
         if efeito in ('kenburns', 'zoom_in'):
-            vf_parts.append(f"zoompan=z='min(zoom+0.0008,1.1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={resolucao[0]}x{resolucao[1]}:fps={FPS}")
+            vf_parts.append(f"zoompan=z='min(zoom+0.0008,1.1)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={resolucao[0]}x{resolucao[1]}:fps={fps}")
         elif efeito == 'zoom_out':
-            vf_parts.append(f"zoompan=z='if(eq(on\\,1)\\,1.1\\,max(zoom-0.0008\\,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={resolucao[0]}x{resolucao[1]}:fps={FPS}")
+            vf_parts.append(f"zoompan=z='if(eq(on\\,1)\\,1.1\\,max(zoom-0.0008\\,1.0))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={resolucao[0]}x{resolucao[1]}:fps={fps}")
         elif efeito == 'pan_right':
-            vf_parts.append(f"zoompan=z=1.1:x='if(eq(on\\,1)\\,0\\,x+0.5)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={resolucao[0]}x{resolucao[1]}:fps={FPS}")
+            vf_parts.append(f"zoompan=z=1.1:x='if(eq(on\\,1)\\,0\\,x+0.5)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={resolucao[0]}x{resolucao[1]}:fps={fps}")
         elif efeito == 'pan_left':
-            vf_parts.append(f"zoompan=z=1.1:x='if(eq(on\\,1)\\,iw*0.1-iw/zoom/2\\,x-0.5)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={resolucao[0]}x{resolucao[1]}:fps={FPS}")
+            vf_parts.append(f"zoompan=z=1.1:x='if(eq(on\\,1)\\,iw*0.1-iw/zoom/2\\,x-0.5)':y='ih/2-(ih/zoom/2)':d={nb_frames}:s={resolucao[0]}x{resolucao[1]}:fps={fps}")
 
     # 4. Filtros de cor
     intensidade = filtro_int / 100.0
@@ -661,6 +831,10 @@ def renderiza_trecho_visual(src, dur, dst_path, fit='contain', efeito='none', fi
     elif filtro == 'blur': vf_parts.append(f"gblur=sigma={max(1, int(filtro_int / 10))}")
     elif filtro == 'contrast': vf_parts.append(f"eq=contrast={1.0 + intensidade:.2f}")
     elif filtro == 'saturate': vf_parts.append(f"hue=s={1.0 + intensidade * 2:.2f}")
+
+    # Clona o quadro em imagens sem zoompan para preencher toda a duração da cena
+    if not is_vid and efeito not in ('kenburns', 'zoom_in', 'zoom_out', 'pan_right', 'pan_left'):
+        vf_parts.append(f"tpad=stop_mode=clone:stop_duration={dur:.3f}")
 
     # 5. Transições de fade (in/out)
     fade_dur = min(trans_dur, dur * 0.4, 1.5)
@@ -673,7 +847,7 @@ def renderiza_trecho_visual(src, dur, dst_path, fit='contain', efeito='none', fi
         if dur > fade_dur * 2:
             vf_parts.append(f"fade=t=out:st={dur - fade_dur:.2f}:d={fade_dur:.2f}:color=white")
 
-    vf_parts.append(f"fps={FPS}")
+    vf_parts.append(f"fps={fps}")
     vf_chain = ",".join(vf_parts)
 
     tem_som_valido = is_vid and (float(volume) > 0.001) and video_tem_audio(src)
@@ -710,22 +884,23 @@ def renderiza_trecho_visual(src, dur, dst_path, fit='contain', efeito='none', fi
             '-video_track_timescale', '90000',
             dst_path
         ]
-    subprocess.run(cmd, capture_output=True)
+    roda_ffmpeg(cmd, os.path.basename(dst_path))
 
-def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4, cb_status=None, resolucao=RESOLUCAO, preset="fast", crf=None, formato="", qualidade=""):
+def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4, cb_status=None, resolucao=RESOLUCAO, preset="fast", crf=None, formato="", qualidade="", fps=FPS):
     is_progresso = hasattr(cb_status, "inicia_etapa")
     total_cenas = len(instrucoes) if instrucoes else 1
 
     if is_progresso:
         cb_status.inicia_etapa("cortes", detalhe=f"Cena 1 de {total_cenas}")
     elif cb_status:
-        msg_status = f"Renderizando {formato} em {qualidade} (gerando cortes na GPU)..." if (formato and qualidade) else "Gerando cortes e analisando vídeos/imagens na GPU..."
+        msg_status = f"Renderizando {formato} em {qualidade} ({fps}fps) (gerando cortes na GPU)..." if (formato and qualidade) else "Gerando cortes e analisando vídeos/imagens na GPU..."
         cb_status("render", msg_status, 60)
 
     tmp_dir = tempfile.mkdtemp(prefix='motor_render_')
     t_inicio_etapa_cortes = time.time()
     
     try:
+        avisos = []
         clips_processados = []
         unidades_visuais = obtem_unidades_visuais(pasta_job)
 
@@ -814,7 +989,7 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                         src=video_src, dur=dur_real, dst_path=dst,
                         fit=fit, efeito=efeito, filtro=filtro, filtro_int=filtro_int,
                         transicao=transicao, trans_dur=trans_dur, slow_factor=1.0,
-                        volume=volume, resolucao=resolucao, preset=preset, crf=crf
+                        volume=volume, resolucao=resolucao, preset=preset, crf=crf, fps=fps
                     )
 
                 # --------------------------------------------------------------
@@ -828,7 +1003,7 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                         src=video_src, dur=dur_real, dst_path=dst,
                         fit=fit, efeito=efeito, filtro=filtro, filtro_int=filtro_int,
                         transicao=transicao, trans_dur=trans_dur, slow_factor=fator_slow,
-                        volume=volume, resolucao=resolucao, preset=preset, crf=crf
+                        volume=volume, resolucao=resolucao, preset=preset, crf=crf, fps=fps
                     )
 
                 # --------------------------------------------------------------
@@ -849,7 +1024,7 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                             src=video_src, dur=dur_parte_video, dst_path=p1,
                             fit=fit, efeito='none', filtro=filtro, filtro_int=filtro_int,
                             transicao=transicao, trans_dur=trans_dur, slow_factor=1.0,
-                            volume=volume, resolucao=resolucao, preset=preset, crf=crf
+                            volume=volume, resolucao=resolucao, preset=preset, crf=crf, fps=fps
                         )
 
                         # 2. Imagem companheira completando o restante do tempo (com faixa de áudio silenciosa padronizada)
@@ -857,7 +1032,7 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                             src=image_src, dur=dur_parte_imagem, dst_path=p2,
                             fit=fit, efeito=efeito, filtro=filtro, filtro_int=filtro_int,
                             transicao='none', trans_dur=trans_dur, slow_factor=1.0,
-                            volume=0.0, resolucao=resolucao, preset=preset, crf=crf
+                            volume=0.0, resolucao=resolucao, preset=preset, crf=crf, fps=fps
                         )
 
                         # 3. Concatenação perfeita com filter_complex (áudio e vídeo em sincronia precisa)
@@ -871,16 +1046,16 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                         if crf:
                             cmd_concat.extend(['-crf', str(crf)])
                         cmd_concat.extend([
-                            '-pix_fmt', 'yuv420p', '-r', str(FPS),
+                            '-pix_fmt', 'yuv420p', '-r', str(fps),
                             '-c:a', 'aac', '-ar', '48000', '-ac', '2',
                             dst
                         ])
-                        subprocess.run(cmd_concat, capture_output=True)
+                        roda_ffmpeg(cmd_concat, f"concatenação vídeo + imagem da cena {i+1} ({id_cena})")
                     else:
                         # Sem imagem companheira: reproduz o vídeo e congela no último frame para preencher o tempo da fala
                         print(f"      🎬 Cena {i+1} ({id_cena}): Vídeo ({dur_vid:.2f}s) estendido com freeze do último frame para preencher ({dur_real:.2f}s) | Vol: {int(volume*100)}%")
                         dur_freeze = max(0.1, round(dur_real - dur_vid, 3))
-                        vf_freeze = f"setpts=PTS-STARTPTS,scale={resolucao[0]}:{resolucao[1]}:force_original_aspect_ratio=decrease,pad={resolucao[0]}:{resolucao[1]}:(ow-iw)/2:(oh-ih)/2:black,tpad=stop_mode=clone:stop_duration={dur_freeze:.3f},fps={FPS}"
+                        vf_freeze = f"setpts=PTS-STARTPTS,scale={resolucao[0]}:{resolucao[1]}:force_original_aspect_ratio=decrease,pad={resolucao[0]}:{resolucao[1]}:(ow-iw)/2:(oh-ih)/2:black,tpad=stop_mode=clone:stop_duration={dur_freeze:.3f},fps={fps}"
                         tem_som_valido = (volume > 0.001) and video_tem_audio(video_src)
                         args_freeze = ['-c:v', 'libx264', '-preset', preset]
                         if crf:
@@ -908,7 +1083,7 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                                 '-map', '1:v:0', '-map', '0:a:0',
                                 dst
                             ]
-                        subprocess.run(cmd_freeze, capture_output=True)
+                        roda_ffmpeg(cmd_freeze, f"congelamento do último frame da cena {i+1} ({id_cena})")
 
             elif image_src:
                 # Caso sem vídeo: renderiza imagem normalmente com áudio mudo padronizado
@@ -917,7 +1092,7 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                     src=image_src, dur=dur_real, dst_path=dst,
                     fit=fit, efeito=efeito, filtro=filtro, filtro_int=filtro_int,
                     transicao=transicao, trans_dur=trans_dur, slow_factor=1.0,
-                    volume=0.0, resolucao=resolucao, preset=preset, crf=crf
+                    volume=0.0, resolucao=resolucao, preset=preset, crf=crf, fps=fps
                 )
 
             else:
@@ -928,7 +1103,7 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                     '-f', 'lavfi', '-i', f'color=black:size={resolucao[0]}x{resolucao[1]}:duration={dur_real}',
                     '-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000',
                     '-t', str(dur_real),
-                    '-r', str(FPS), '-pix_fmt', 'yuv420p',
+                    '-r', str(fps), '-pix_fmt', 'yuv420p',
                     '-c:v', 'libx264', '-preset', preset,
                 ]
                 if crf:
@@ -938,7 +1113,7 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                     '-map', '0:v:0', '-map', '1:a:0',
                     dst
                 ])
-                subprocess.run(cmd_black, capture_output=True)
+                roda_ffmpeg(cmd_black, f"fundo preto da cena {i+1} ({id_cena})")
 
             clips_processados.append({'path': dst, 'duration': dur_real})
 
@@ -963,10 +1138,11 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                 f.write(f"file '{clip['path']}'\n")
 
         v_temp = os.path.join(tmp_dir, 'video_com_som_ambiente.mp4')
-        subprocess.run([
+        cmd_concat_demuxer = [
             'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
             '-i', concat_txt, '-c', 'copy', '-fflags', '+genpts', v_temp
-        ], capture_output=True)
+        ]
+        roda_ffmpeg(cmd_concat_demuxer, "concatenação de cenas (demuxer)")
 
         if is_progresso:
             cb_status.inicia_etapa("mixagem", detalhe="Mixando áudio e gerando MP4 final...")
@@ -982,7 +1158,7 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
 
         # Mixagem do áudio ambiente dos clipes (0:a), voz/narração master (1:a) e BGM opcional (2:a)
         if bgm_path and os.path.exists(bgm_path):
-            subprocess.run([
+            cmd_mix_bgm = [
                 'ffmpeg', '-y',
                 '-i', v_temp,
                 '-i', audio_path,
@@ -990,17 +1166,90 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
                 '-filter_complex', '[0:a]volume=1.0[amb];[1:a]volume=1.0[voz];[2:a]volume=0.2[bgm];[voz][amb][bgm]amix=inputs=3:duration=first:dropout_transition=2[aout]',
                 '-c:v', 'copy', '-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
                 '-shortest', '-map', '0:v:0', '-map', '[aout]', saida_mp4
-            ], capture_output=True)
+            ]
+            roda_ffmpeg(cmd_mix_bgm, "mixagem final com BGM")
         else:
-            subprocess.run([
+            cmd_mix = [
                 'ffmpeg', '-y',
                 '-i', v_temp,
                 '-i', audio_path,
                 '-filter_complex', '[0:a]volume=1.0[amb];[1:a]volume=1.0[voz];[voz][amb]amix=inputs=2:duration=first:dropout_transition=2[aout]',
                 '-c:v', 'copy', '-c:a', 'aac', '-ar', '48000', '-b:a', '192k',
                 '-shortest', '-map', '0:v:0', '-map', '[aout]', saida_mp4
-            ], capture_output=True)
+            ]
+            roda_ffmpeg(cmd_mix, "mixagem final")
 
+        # Validação do MP4 final via ffprobe e detecção de anomalias de duração/fps
+        try:
+            cmd_probe = [
+                'ffprobe', '-v', 'error',
+                '-select_streams', 'v:0',
+                '-show_entries', 'stream=duration,nb_frames,avg_frame_rate',
+                '-of', 'json',
+                saida_mp4
+            ]
+            out_probe = subprocess.check_output(cmd_probe, text=True).strip()
+            data_probe = json.loads(out_probe)
+            streams = data_probe.get('streams', [])
+            if streams:
+                st = streams[0]
+                dur_str = st.get('duration')
+                frames_str = st.get('nb_frames')
+                avg_fps_str = st.get('avg_frame_rate', '')
+
+                dur_video = 0.0
+                if dur_str and dur_str != 'N/A':
+                    try:
+                        dur_video = float(dur_str)
+                    except Exception:
+                        pass
+
+                if dur_video <= 0.05:
+                    cmd_fmt = [
+                        'ffprobe', '-v', 'error',
+                        '-show_entries', 'format=duration',
+                        '-of', 'default=noprint_wrappers=1:nokey=1',
+                        saida_mp4
+                    ]
+                    out_fmt = subprocess.check_output(cmd_fmt, text=True).strip()
+                    if out_fmt and out_fmt != 'N/A':
+                        try:
+                            dur_video = float(out_fmt)
+                        except Exception:
+                            pass
+
+                fps_nominal = 0.0
+                if avg_fps_str and avg_fps_str != '0/0':
+                    if '/' in avg_fps_str:
+                        num, den = avg_fps_str.split('/', 1)
+                        if float(den) > 0:
+                            fps_nominal = float(num) / float(den)
+                    else:
+                        fps_nominal = float(avg_fps_str)
+
+                nb_frames_val = 0
+                if frames_str and frames_str != 'N/A' and str(frames_str).isdigit():
+                    nb_frames_val = int(frames_str)
+                elif fps_nominal > 0 and dur_video > 0:
+                    nb_frames_val = int(round(fps_nominal * dur_video))
+
+                fps_medio = (nb_frames_val / dur_video) if (dur_video > 0 and nb_frames_val > 0) else fps_nominal
+
+                print(f"📊 Vídeo final: {dur_video:.2f} s, {nb_frames_val} quadros, fps médio {fps_medio:.2f}")
+
+                # (a) Duração do vídeo menor que a narração em mais de 2s
+                if duracao_audio and (duracao_audio - dur_video > 2.0):
+                    diff_s = round(duracao_audio - dur_video, 1)
+                    avisos.append(f"O vídeo final tem {diff_s} s a menos que a narração.")
+
+                # (b) FPS médio menor que 90% do esperado
+                if fps and fps_medio < (0.90 * fps):
+                    fps_fmt = round(fps_medio, 1)
+                    avisos.append(f"O vídeo tem taxa de quadros variável (média de {fps_fmt} fps, esperado {fps}).")
+        except Exception as e:
+            print(f"⚠️ Aviso ao validar MP4 final: {e}")
+
+        return avisos
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -1228,6 +1477,11 @@ class ProgressoJob:
 @app.get("/status")
 def get_engine_status():
     gpu_nome = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    try:
+        total_cache = len([f for f in os.listdir(PASTA_CACHE) if f.endswith('.json')]) if os.path.exists(PASTA_CACHE) else 0
+    except Exception:
+        total_cache = 0
+
     return {
         "status": "online",
         "motor": "Motor de Dobra 4.2 AI Studio",
@@ -1235,7 +1489,9 @@ def get_engine_status():
         "gpu": gpu_nome,
         "whisper_model": WHISPER_MODEL,
         "sem_drive": True,
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "cache_transcricao_ativo": USAR_CACHE_TRANSCRICAO,
+        "cache_transcricoes": total_cache,
     }
 
 @app.get("/api/job_status/{job_id}")
@@ -1249,8 +1505,9 @@ def get_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job não encontrado")
     return JOBS_STATUS[job_id]
 
-def processa_job_background(job_id: str, tipo: str, formato: str = "", qualidade: str = ""):
+def processa_job_background(job_id: str, tipo: str, formato: str = "", qualidade: str = "", ignorar_cache: bool = False, fps: Optional[int] = None):
     pasta_job = os.path.join(PASTA_JOBS, job_id)
+    fps_job = fps if (fps and 10 <= fps <= 120) else FPS
 
     # Resolução do perfil de vídeo configurado
     perfil = resolve_perfil(formato, qualidade)
@@ -1324,8 +1581,8 @@ def processa_job_background(job_id: str, tipo: str, formato: str = "", qualidade
                     blocos[-1]['texto'] = f"{blocos[-1]['texto']} {texto_extra}".strip()
                 print(f"✂️ Limitando para {total_visuais} cenas para coincidir com as mídias enviadas.")
 
-            # Transcrição Whisper com progresso real de frames
-            palavras, duracao_audio = transcreve_audio(audio_path, progresso)
+            # Transcrição Whisper com progresso real e suporte a cache por hash de áudio
+            palavras, duracao_audio = transcreve_audio(audio_path, progresso, ignorar_cache=ignorar_cache)
 
             # Mapeamento e sincronia de roteiro bloco a bloco
             instrucoes = mapeia_timeline(palavras, duracao_audio, blocos, progresso)
@@ -1391,15 +1648,21 @@ def processa_job_background(job_id: str, tipo: str, formato: str = "", qualidade
                 json.dump(timeline_data, f, ensure_ascii=False, indent=2)
 
         # Renderização em MP4 se solicitada
+        avisos_render = []
         if tipo in ['timeline_e_render', 'render']:
             saida_mp4 = os.path.join(pasta_job, "video_final.mp4")
-            renderiza_video(
+            avisos_render = renderiza_video(
                 instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4, progresso,
                 resolucao=resolucao_job, preset=preset_job, crf=crf_job,
-                formato=formato, qualidade=qualidade
-            )
+                formato=formato, qualidade=qualidade, fps=fps_job
+            ) or []
 
-        progresso.conclui("Job finalizado com sucesso!")
+        # Mensagem de conclusão: incorpora avisos da validação caso existam
+        if avisos_render:
+            msg_final = f"Render concluído com avisos: {' '.join(avisos_render)}"
+            progresso.conclui(msg_final)
+        else:
+            progresso.conclui("Job finalizado com sucesso!")
     except Exception as e:
         print(f"❌ Erro no job {job_id}: {e}")
         progresso("erro", f"Erro: {str(e)}", err=str(e))
@@ -1410,6 +1673,8 @@ async def enviar_job(
     tipo: str = Form("timeline"),
     formato: str = Form(""),
     qualidade: str = Form(""),
+    fps: str = Form(""),
+    ignorar_cache: str = Form(""),
     arquivos: List[UploadFile] = File(...)
 ):
     """
@@ -1417,11 +1682,24 @@ async def enviar_job(
     sem precisar salvar nem sincronizar nada no Google Drive!
     """
     f_clean = (formato or "").strip()
-    q_clean = (qualidade or "").strip()
+    q_clean = (qualidade or "").strip().lower()
+    ignorar_cache_bool = str(ignorar_cache).strip().lower() in ["1", "true", "on"]
+
+    # Mapeamento de aliases
+    if q_clean in ("2k", "1440"):
+        q_clean = "1440p"
+    elif q_clean in ("4k", "2160"):
+        q_clean = "2160p"
+
+    fps_int = None
+    if fps and str(fps).strip().isdigit():
+        val = int(str(fps).strip())
+        if 10 <= val <= 120:
+            fps_int = val
 
     # Validação de formato e qualidade contra whitelist
     formatos_validos = ["16:9", "9:16", "1:1"]
-    qualidades_validas = ["480p", "720p", "1080p"]
+    qualidades_validas = ["480p", "720p", "1080p", "1440p", "2160p", "2k", "4k"]
 
     if f_clean and f_clean not in formatos_validos:
         raise HTTPException(
@@ -1431,7 +1709,7 @@ async def enviar_job(
     if q_clean and q_clean not in qualidades_validas:
         raise HTTPException(
             status_code=400,
-            detail=f"Qualidade de renderização inválida: '{q_clean}'. Qualidades suportadas: 480p, 720p, 1080p."
+            detail=f"Qualidade de renderização inválida: '{q_clean}'. Qualidades suportadas: 480p, 720p, 1080p, 1440p, 2160p."
         )
 
     job_id = f"job_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
@@ -1445,9 +1723,10 @@ async def enviar_job(
         with open(destino, "wb") as buffer:
             shutil.copyfileobj(arq.file, buffer)
 
-    info_perfil = f" [{f_clean} {q_clean}]" if (f_clean and q_clean) else ""
+    fps_tag = f" {fps_int}fps" if fps_int else ""
+    info_perfil = f" [{f_clean} {q_clean}{fps_tag}]" if (f_clean and q_clean) else ""
     set_job_status(job_id, "recebido", f"{len(arquivos)} arquivos recebidos no Colab{info_perfil}", 10)
-    background_tasks.add_task(processa_job_background, job_id, tipo, f_clean, q_clean)
+    background_tasks.add_task(processa_job_background, job_id, tipo, f_clean, q_clean, ignorar_cache_bool, fps_int)
 
     return {
         "status": "sucesso",

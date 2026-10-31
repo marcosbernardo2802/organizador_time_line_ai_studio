@@ -1,8 +1,8 @@
 // Serviço de integração direta com o Motor de Dobra 4.2 AI Studio (via túnel ngrok)
 
-// Tipos de formato de aspecto e qualidade para renderização no Colab
-export type FormatoRender = '16:9' | '9:16' | '1:1';
-export type QualidadeRender = '480p' | '720p' | '1080p';
+// Tipos de formato de aspecto, qualidade e FPS para renderização no Colab
+import { EtapaJob, FormatoRender, QualidadeRender, FpsOpcao } from '../types';
+export type { FormatoRender, QualidadeRender, FpsOpcao };
 
 export interface MotorStatusInfo {
   online: boolean;
@@ -12,8 +12,6 @@ export interface MotorStatusInfo {
   whisper_model?: string;
   error?: string;
 }
-
-import { EtapaJob } from '../types';
 
 export interface JobStatusResponse {
   job_id: string;
@@ -126,7 +124,7 @@ export const motorApi = {
     files: File[],
     tipo: 'timeline' | 'render' | 'timeline_e_render' = 'timeline',
     onProgress?: (mensagem: string, progresso: number, status?: JobStatusResponse) => void,
-    opcoes?: { formato?: FormatoRender; qualidade?: QualidadeRender }
+    opcoes?: { formato?: FormatoRender; qualidade?: QualidadeRender; fps?: FpsOpcao; ignorarCache?: boolean }
   ): Promise<{ job_id: string; timeline?: any; videoBlob?: Blob | null }> {
     let base = this.getUrl();
     if (!base) {
@@ -149,12 +147,18 @@ export const motorApi = {
 
     const formData = new FormData();
     formData.append('tipo', tipo);
-    // Anexa formato e qualidade de renderização para o Colab se definidos
+    // Anexa formato, qualidade e FPS de renderização para o Colab se definidos
     if (opcoes?.formato) {
       formData.append('formato', opcoes.formato);
     }
     if (opcoes?.qualidade) {
       formData.append('qualidade', opcoes.qualidade);
+    }
+    if (opcoes?.fps) {
+      formData.append('fps', String(opcoes.fps));
+    }
+    if (opcoes?.ignorarCache) {
+      formData.append('ignorar_cache', '1');
     }
     files.forEach((file) => {
       formData.append('arquivos', file, file.name);

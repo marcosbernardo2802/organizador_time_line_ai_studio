@@ -35,14 +35,21 @@ import { Timeline } from './components/Timeline/Timeline';
 import { SendToMotorModal } from './components/Modals/SendToMotorModal';
 import { ExportModal } from './components/Modals/ExportModal';
 import { MotorNgrokModal } from './components/Modals/MotorNgrokModal';
-import { motorApi, MotorStatusInfo, FormatoRender, QualidadeRender } from './services/motorApi';
+import { motorApi, MotorStatusInfo, FormatoRender, QualidadeRender, FpsOpcao } from './services/motorApi';
 import { localWorkspace } from './services/localWorkspace';
+import { limpaThumbnailsExceto, pausaThumbnails } from './utils/thumbnails';
+import { limpaWaveformsExceto, pausaWaveform } from './utils/waveform';
 
 export default function App() {
   // Motor GPU (ngrok) & Workspace
   const [motorOnline, setMotorOnline] = useState<boolean>(false);
   const [motorGpu, setMotorGpu] = useState<string>('');
   const [workspaceName, setWorkspaceName] = useState<string | null>(() => localWorkspace.getActiveFolderName());
+
+  // Formato de aspect ratio, FPS e resolução configurados
+  const [formato, setFormato] = useState<FormatoRender>('16:9');
+  const [fps, setFps] = useState<FpsOpcao>(24);
+  const [qualidade, setQualidade] = useState<QualidadeRender>('1080p');
 
   // UI modais
   const [modal, setModal] = useState<null | 'ai' | 'export' | 'motor'>(null);
@@ -55,6 +62,7 @@ export default function App() {
     bgm: null,
   });
   const [aiStatus, setAiStatus] = useState<AiStatus>({ step: '', msg: '', pct: 0, running: false, error: '' });
+  const [ignorarCache, setIgnorarCache] = useState<boolean>(false);
 
   // Timeline (editor)
   const [clips, setClips] = useState<ClipItem[]>([]);
@@ -118,6 +126,31 @@ export default function App() {
     document.documentElement.setAttribute('data-theme', theme);
     localStorage.setItem('cronicas_theme', theme);
   }, [theme]);
+
+  // Forma de onda real opcional (desativada por padrão ou configurada pelo usuário para acelerar projetos grandes)
+  const [showWaveform, setShowWaveform] = useState<boolean>(
+    () => localStorage.getItem('cronicas_show_waveform') === 'true'
+  );
+  const handleToggleWaveform = useCallback(() => {
+    setShowWaveform((prev) => {
+      const next = !prev;
+      localStorage.setItem('cronicas_show_waveform', String(next));
+      return next;
+    });
+  }, []);
+
+  // Limpeza de cache de miniaturas e formas de onda ao remover ou alterar mídias da biblioteca
+  useEffect(() => {
+    const urlsAtivas = new Set(library.map((m) => m.url).filter((u): u is string => Boolean(u)));
+    limpaThumbnailsExceto(urlsAtivas);
+    limpaWaveformsExceto(urlsAtivas);
+  }, [library]);
+
+  // Pausa a geração em segundo plano de miniaturas e formas de onda durante a reprodução
+  useEffect(() => {
+    pausaThumbnails(isPlaying);
+    pausaWaveform(isPlaying);
+  }, [isPlaying]);
 
   // Guias do Painel Direito
   const [rightPanelTab, setRightPanelTab] = useState('Ajustes');
@@ -386,73 +419,89 @@ export default function App() {
 
   // ── ENVIAR JOB DIRETO PARA O MOTOR (NGROK GPU) ───────────────────────────
   const enviaJobDireto = async () => {
+    // 1. Feedback visual imediato ao clicar no botão
+    setAiStatus({
+      step: 'iniciando',
+      msg: 'Preparando arquivos para a GPU do Colab...',
+      pct: 3,
+      running: true,
+      error: '',
+    });
+
     // Solicita permissão para notificações do navegador em resposta ao clique do usuário
     pedePermissaoNotificacao();
 
     if (!aiFiles.audio || !aiFiles.roteiro || aiFiles.images.length === 0) {
-      alert('Selecione pelo menos uma narração (áudio), um roteiro (.txt) e imagens/vídeos.');
+      setAiStatus({
+        step: 'erro',
+        msg: '',
+        pct: 0,
+        running: false,
+        error: 'Selecione pelo menos uma narração (áudio), um roteiro (.txt) e imagens/vídeos.',
+      });
       return;
     }
 
-    // Validação prévia de roteiro contra mídias visuais antes de enviar ao motor
-    const validacao = await validaRoteiroContraMidias(aiFiles.roteiro, aiFiles.images);
-    if (validacao.avisos.length > 0) {
-      const msg = `Avisos de alinhamento antes do envio:\n\n• ${validacao.avisos.join('\n• ')}\n\nEnviar mesmo assim?`;
-      if (!confirm(msg)) {
-        return; // Aborta sem alterar aiStatus se o usuário cancelar
+    // 2. Validação prévia de roteiro contra mídias visuais (informativa, sem confirm bloqueante de iframe)
+    try {
+      const validacao = await validaRoteiroContraMidias(aiFiles.roteiro, aiFiles.images);
+      if (validacao.avisos.length > 0) {
+        console.info('Avisos de alinhamento de roteiro/mídias (o motor adaptará automaticamente):', validacao.avisos);
       }
+    } catch (valErr) {
+      console.warn('Aviso na validação de roteiro:', valErr);
     }
 
-    // Garante que todas as mídias selecionadas estejam na biblioteca com URLs locais ativas e durações reais
-    const mediasVisuais: MediaItem[] = await mapInBatches(aiFiles.images, 6, async (f, i) => {
-      fileCache.current[f.name] = f;
-      const url = URL.createObjectURL(f);
-      const isVid = isVideoFile(f.name, f.type);
-      const dur = isVid ? await getMediaDuration(f, 'video', 5) : 5;
-      return {
-        id: `local-media-${i}-${Date.now()}`,
-        name: f.name,
-        type: f.type || (isVid ? 'video/mp4' : 'image/jpeg'),
-        url,
-        duration: dur,
-      };
-    });
+    // 3. Cadastra mídias na biblioteca local sem travar o navegador com decodificações síncronas de vídeo
+    const novasMedias: MediaItem[] = [];
+    const nomesExistentes = new Set(library.map((m) => m.name.toLowerCase()));
 
-    const mediasGarantidas: MediaItem[] = [...mediasVisuais];
+    for (let i = 0; i < aiFiles.images.length; i++) {
+      const f = aiFiles.images[i];
+      fileCache.current[f.name] = f;
+      if (!nomesExistentes.has(f.name.toLowerCase())) {
+        const isVid = isVideoFile(f.name, f.type);
+        novasMedias.push({
+          id: `local-media-${i}-${Date.now()}`,
+          name: f.name,
+          type: f.type || (isVid ? 'video/mp4' : 'image/jpeg'),
+          url: URL.createObjectURL(f),
+          duration: 5, // Duração inicial estimada; a GPU calculará o corte real na timeline
+        });
+      }
+    }
 
     if (aiFiles.audio) {
       const f = aiFiles.audio;
       fileCache.current[f.name] = f;
-      const url = URL.createObjectURL(f);
-      const dur = await getMediaDuration(f, 'audio', 60);
-      mediasGarantidas.push({
-        id: `local-audio-${Date.now()}`,
-        name: f.name,
-        type: f.type || 'audio/mp3',
-        url,
-        duration: dur,
-      });
+      if (!nomesExistentes.has(f.name.toLowerCase())) {
+        novasMedias.push({
+          id: `local-audio-${Date.now()}`,
+          name: f.name,
+          type: f.type || 'audio/mp3',
+          url: URL.createObjectURL(f),
+          duration: 60,
+        });
+      }
     }
 
     if (aiFiles.bgm) {
       const f = aiFiles.bgm;
       fileCache.current[f.name] = f;
-      const url = URL.createObjectURL(f);
-      const dur = await getMediaDuration(f, 'audio', 60);
-      mediasGarantidas.push({
-        id: `local-bgm-${Date.now()}`,
-        name: f.name,
-        type: f.type || 'audio/mp3',
-        url,
-        duration: dur,
-      });
+      if (!nomesExistentes.has(f.name.toLowerCase())) {
+        novasMedias.push({
+          id: `local-bgm-${Date.now()}`,
+          name: f.name,
+          type: f.type || 'audio/mp3',
+          url: URL.createObjectURL(f),
+          duration: 60,
+        });
+      }
     }
 
-    setLibrary((prev) => {
-      const nomes = new Set(prev.filter((m) => m.url && !m.placeholder).map((m) => m.name.toLowerCase()));
-      const novas = mediasGarantidas.filter((m) => !nomes.has(m.name.toLowerCase()));
-      return novas.length > 0 ? [...prev, ...novas] : prev;
-    });
+    if (novasMedias.length > 0) {
+      setLibrary((prev) => [...prev, ...novasMedias]);
+    }
 
     setAiStatus({
       step: 'iniciando',
@@ -463,28 +512,46 @@ export default function App() {
     });
 
     try {
-      const filesToSend: File[] = [aiFiles.audio, aiFiles.roteiro, ...aiFiles.images];
+      // 4. Otimização para projetos grandes:
+      // Para cálculo da timeline (tipo === 'timeline'), a GPU do Colab só necessita do áudio real (Whisper),
+      // do roteiro real (.txt) e dos NOMES e EXTENSÕES das mídias visuais (obtem_unidades_visuais só lê os nomes).
+      // Enviar centenas de megabytes ou gigabytes de vídeos brutos pelo túnel ngrok causava 'Failed to fetch' e estouro de payload.
+      // Criamos stubs leves (0 bytes) com o mesmo nome e tipo para as mídias visuais grandes (> 500 KB ou vídeos):
+      const midiasOtimizadas: File[] = aiFiles.images.map((f) => {
+        if (f.size > 500 * 1024 || isVideoFile(f.name, f.type)) {
+          return new File([], f.name, { type: f.type || 'video/mp4' });
+        }
+        return f;
+      });
+
+      const filesToSend: File[] = [aiFiles.audio, aiFiles.roteiro, ...midiasOtimizadas];
       if (aiFiles.bgm) filesToSend.push(aiFiles.bgm);
 
-      const res = await motorApi.enviarJob(filesToSend, 'timeline', (msg, pct, status) => {
-        // A porcentagem nunca deve diminuir durante o job (Math.max)
-        setAiStatus((p) => ({
-          ...p,
-          msg,
-          pct: Math.max(p.pct, pct),
-          running: true,
-          error: '',
-          etapas: status?.etapas || p.etapas,
-          detalhe: status?.detalhe !== undefined ? (status.detalhe || undefined) : p.detalhe,
-          etapaIndice: status?.etapa_indice ?? p.etapaIndice,
-          etapaTotal: status?.etapa_total ?? p.etapaTotal,
-          etaSegundos: status?.eta_s !== undefined ? status.eta_s : p.etaSegundos,
-        }));
-      });
+      const res = await motorApi.enviarJob(
+        filesToSend,
+        'timeline',
+        (msg, pct, status) => {
+          // A porcentagem nunca deve diminuir durante o job (Math.max)
+          setAiStatus((p) => ({
+            ...p,
+            msg,
+            pct: Math.max(p.pct, pct),
+            running: true,
+            error: '',
+            etapas: status?.etapas || p.etapas,
+            detalhe: status?.detalhe !== undefined ? (status.detalhe || undefined) : p.detalhe,
+            etapaIndice: status?.etapa_indice ?? p.etapaIndice,
+            etapaTotal: status?.etapa_total ?? p.etapaTotal,
+            etaSegundos: status?.eta_s !== undefined ? status.eta_s : p.etaSegundos,
+          }));
+        },
+        { ignorarCache }
+      );
 
       if (res.timeline) {
         aplicaTimelineNoEditor(res.timeline);
         tocaSomConclusao();
+        setIgnorarCache(false);
 
         const qtdCenas = res.timeline.cenas?.length || 0;
         const roteiroNome = aiFiles.roteiro?.name ? ` para ${aiFiles.roteiro.name}` : '';
@@ -526,13 +593,17 @@ export default function App() {
   };
 
   // ── DRAG & DROP TIMELINE ────────────────────────────────────────────────────
-  const onClipMouseDown = (e: React.MouseEvent, clipId: string, type: string) => {
+  const onClipMouseDown = useCallback((e: React.MouseEvent, clipId: string, type: string) => {
     e.stopPropagation();
-    const clip = clips.find((c) => c.id === clipId);
-    if (!clip) return;
-    setDragState({ id: clipId, type, startX: e.clientX, origStart: clip.startTime, origDur: clip.duration, origClips: clips });
-    setSelectedId(clipId);
-  };
+    setClips((currentClips) => {
+      const clip = currentClips.find((c) => c.id === clipId);
+      if (clip) {
+        setDragState({ id: clipId, type, startX: e.clientX, origStart: clip.startTime, origDur: clip.duration, origClips: currentClips });
+        setSelectedId(clipId);
+      }
+      return currentClips;
+    });
+  }, []);
 
   const getSnapTarget = (time: number, excludeId: string) => {
     let target = time;
@@ -773,6 +844,11 @@ export default function App() {
     }
   }, [isPlaying, currentTime, clips, library, volumes, duckingEnabled]);
 
+  // Duração máxima calculada da timeline de forma memoizada para não recomputar a cada frame do tick
+  const maxProjectTime = React.useMemo(() => {
+    return clips.length > 0 ? Math.max(...clips.map((c) => c.startTime + c.duration)) : duration;
+  }, [clips, duration]);
+
   useEffect(() => {
     if (isPlaying) {
       const tick = () => {
@@ -780,14 +856,12 @@ export default function App() {
         const delta = (now - lastRef.current) / 1000;
         lastRef.current = now;
 
-        const maxTime = clips.length > 0 ? Math.max(...clips.map((c) => c.startTime + c.duration)) : duration;
-
         setCurrentTime((t) => {
-          if (t + delta >= maxTime) {
+          if (t + delta >= maxProjectTime) {
             setIsPlaying(false);
             if (narrationRef.current) narrationRef.current.pause();
             if (bgmRef.current) bgmRef.current.pause();
-            return maxTime;
+            return maxProjectTime;
           }
           return t + delta;
         });
@@ -801,7 +875,7 @@ export default function App() {
     return () => {
       if (animRef.current) cancelAnimationFrame(animRef.current);
     };
-  }, [isPlaying, duration, clips]);
+  }, [isPlaying, maxProjectTime]);
 
   // Preview da imagem ativa
   useEffect(() => {
@@ -817,9 +891,12 @@ export default function App() {
   // ── SALVAR / CARREGAR PROJETO LOCAL & AUTOSAVE ───────────────────────────
   // Função auxiliar para estruturar o objeto do projeto (usada em salvamento manual e autosave)
   const montaObjetoProjeto = (clipsArr: ClipItem[], libArr: MediaItem[], dur: number) => ({
-    versao: '3.0',
+    versao: '3.1',
     salvo_em: new Date().toISOString(),
     duration: dur,
+    formato,
+    fps,
+    qualidade,
     clips: clipsArr,
     library: libArr.map((m) => ({
       id: m.id,
@@ -831,15 +908,15 @@ export default function App() {
   });
 
   // Refs para manter o estado atualizado no timer de autosave sem reiniciar o intervalo
-  const editorStateRef = useRef({ clips, library, duration });
-  editorStateRef.current = { clips, library, duration };
+  const editorStateRef = useRef({ clips, library, duration, formato, fps, qualidade });
+  editorStateRef.current = { clips, library, duration, formato, fps, qualidade };
 
   const houveAlteracaoAutosaveRef = useRef(false);
 
-  // Marca alteração sempre que clips, library ou duration mudarem
+  // Marca alteração sempre que clips, library, duration, formato, fps ou qualidade mudarem
   useEffect(() => {
     houveAlteracaoAutosaveRef.current = true;
-  }, [clips, library, duration]);
+  }, [clips, library, duration, formato, fps, qualidade]);
 
   const salvaProjetoLocal = () => {
     try {
@@ -876,6 +953,16 @@ export default function App() {
       setLibrary(projeto.library || []);
       setDuration(projeto.duration || 60);
       setCurrentTime(0);
+
+      if (projeto.formato && ['16:9', '9:16', '1:1'].includes(projeto.formato)) {
+        setFormato(projeto.formato);
+      }
+      if (projeto.fps && [24, 30, 60].includes(Number(projeto.fps))) {
+        setFps(Number(projeto.fps) as FpsOpcao);
+      }
+      if (projeto.qualidade && ['480p', '720p', '1080p', '1440p', '2160p'].includes(projeto.qualidade)) {
+        setQualidade(projeto.qualidade);
+      }
 
       const semUrl = (projeto.library || []).filter((m: any) => m.placeholder).length;
       if (semUrl > 0) {
@@ -1348,6 +1435,7 @@ export default function App() {
           activeClip={activeVideoClip}
           library={library}
           isPlaying={isPlaying}
+          formato={formato}
         />
 
         {/* ── PAINEL DIREITO (AJUSTES, EFEITOS, FILTROS, TRANSIÇÕES, ÁUDIO) ── */}
@@ -1386,6 +1474,14 @@ export default function App() {
         canRedo={future.length > 0}
         isPlaying={isPlaying}
         snapOn={snapOn}
+        showWaveform={showWaveform}
+        onToggleWaveform={handleToggleWaveform}
+        formato={formato}
+        onChangeFormato={setFormato}
+        fps={fps}
+        onChangeFps={setFps}
+        qualidade={qualidade}
+        onChangeQualidade={setQualidade}
         onUndo={undo}
         onRedo={redo}
         onStop={() => {
@@ -1466,6 +1562,9 @@ export default function App() {
         aiStatus={aiStatus}
         onFileChange={handleFiles}
         onSubmitDirectJob={enviaJobDireto}
+        ignorarCache={ignorarCache}
+        onToggleIgnorarCache={setIgnorarCache}
+        theme={theme}
       />
 
       <ExportModal
@@ -1474,15 +1573,19 @@ export default function App() {
         renderState={renderState}
         motorOnline={motorOnline}
         onOpenMotorModal={() => setModal('motor')}
+        initialFormato={formato}
+        initialQualidade={qualidade}
+        initialFps={fps}
+        theme={theme}
         onExportJson={() => {
-          const data = { clips, library: library.map((m) => ({ ...m, url: undefined })), duration };
+          const data = { clips, library: library.map((m) => ({ ...m, url: undefined })), duration, formato, fps, qualidade };
           const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
           const a = document.createElement('a');
           a.href = URL.createObjectURL(blob);
           a.download = 'projeto_cronicas.json';
           a.click();
         }}
-        onRenderColab={async (opcoes: { formato: FormatoRender; qualidade: QualidadeRender }) => {
+        onRenderColab={async (opcoes: { formato: FormatoRender; qualidade: QualidadeRender; fps?: FpsOpcao }) => {
           const videoClips = clips
             .filter((c) => c.trackId === 'video-1')
             .sort((a, b) => a.startTime - b.startTime);
@@ -1651,9 +1754,10 @@ export default function App() {
               );
 
               if (res.videoBlob) {
-                // Nome do arquivo com sufixo de qualidade e formato (ex.: video_1080p_16x9.mp4)
+                // Nome do arquivo com sufixo de qualidade, formato e FPS (ex.: video_1080p_16x9_24fps.mp4)
                 const formatoSlug = opcoes.formato.replace(':', 'x');
-                const nomeArquivo = `video_${opcoes.qualidade}_${formatoSlug}.mp4`;
+                const fpsSlug = opcoes.fps ? `_${opcoes.fps}fps` : '';
+                const nomeArquivo = `video_${opcoes.qualidade}_${formatoSlug}${fpsSlug}.mp4`;
 
                 const url = URL.createObjectURL(res.videoBlob);
                 const a = document.createElement('a');
@@ -1669,10 +1773,11 @@ export default function App() {
                 tocaSomConclusao();
                 notificaConclusao('Vídeo renderizado', 'O vídeo está pronto para download.');
 
+                const fpsInfo = opcoes.fps ? ` ${opcoes.fps}fps` : '';
                 setRenderState({
                   isRendering: false,
                   progress: 100,
-                  status: `✅ Vídeo (${opcoes.formato} ${opcoes.qualidade}) renderizado pela GPU com sucesso! O download foi iniciado.`,
+                  status: `✅ Vídeo (${opcoes.formato} ${opcoes.qualidade}${fpsInfo}) renderizado pela GPU com sucesso! O download foi iniciado.`,
                 });
               }
             } catch (err: any) {
@@ -1853,6 +1958,7 @@ export default function App() {
       <MotorNgrokModal
         isOpen={modal === 'motor'}
         onClose={() => setModal(null)}
+        theme={theme}
         onConnected={(info) => {
           setMotorOnline(info.online);
           if (info.gpu) setMotorGpu(info.gpu);
@@ -1866,9 +1972,9 @@ export default function App() {
             position: 'fixed',
             bottom: 24,
             right: 24,
-            background: 'rgba(13, 19, 31, 0.95)',
-            border: '1px solid #00f0ff',
-            boxShadow: '0 0 25px rgba(0, 240, 255, 0.3)',
+            background: theme === 'light' ? 'rgba(255, 255, 255, 0.96)' : 'rgba(13, 19, 31, 0.95)',
+            border: `1px solid ${theme === 'light' ? '#38bdf8' : '#00f0ff'}`,
+            boxShadow: theme === 'light' ? '0 4px 20px rgba(0, 0, 0, 0.15)' : '0 0 25px rgba(0, 240, 255, 0.3)',
             borderRadius: 12,
             padding: '12px 16px',
             zIndex: 99999,
@@ -1881,15 +1987,16 @@ export default function App() {
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
               <span style={{ fontSize: 16 }}>⚡</span>
-              <strong style={{ color: '#00f0ff', fontSize: 12 }}>Renderizando na GPU (Colab)</strong>
+              <strong style={{ color: theme === 'light' ? '#0284c7' : '#00f0ff', fontSize: 12 }}>Renderizando na GPU (Colab)</strong>
             </div>
             <button
               onClick={() => setModal('export')}
               style={{
                 background: 'transparent',
                 border: 'none',
-                color: '#38bdf8',
+                color: theme === 'light' ? '#0284c7' : '#38bdf8',
                 fontSize: 11,
+                fontWeight: 600,
                 cursor: 'pointer',
                 textDecoration: 'underline',
                 padding: '0 4px',
@@ -1902,7 +2009,7 @@ export default function App() {
           <div
             style={{
               height: 6,
-              background: '#1e293b',
+              background: theme === 'light' ? '#e2e8f0' : '#1e293b',
               borderRadius: 3,
               overflow: 'hidden',
               marginBottom: 6,
@@ -1912,13 +2019,13 @@ export default function App() {
               style={{
                 width: `${Math.max(5, renderState.progress)}%`,
                 height: '100%',
-                background: '#00f0ff',
+                background: theme === 'light' ? '#0284c7' : '#00f0ff',
                 transition: 'width 0.3s ease',
               }}
             />
           </div>
 
-          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: '#cbd5e1' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: theme === 'light' ? '#1e293b' : '#cbd5e1' }}>
             <span
               style={{
                 overflow: 'hidden',
@@ -1934,13 +2041,13 @@ export default function App() {
             >
               {renderState.status}
               {renderState.etapaIndice && renderState.etapaTotal && (
-                <span style={{ color: '#94a3b8', marginLeft: 4 }}>
+                <span style={{ color: theme === 'light' ? '#64748b' : '#94a3b8', marginLeft: 4 }}>
                   · Etapa {renderState.etapaIndice}/{renderState.etapaTotal}
                   {renderState.detalhe ? ` · ${renderState.detalhe}` : ''}
                 </span>
               )}
             </span>
-            <strong style={{ color: '#00f0ff', marginLeft: 8 }}>{renderState.progress}%</strong>
+            <strong style={{ color: theme === 'light' ? '#0284c7' : '#00f0ff', marginLeft: 8 }}>{renderState.progress}%</strong>
           </div>
         </div>
       )}

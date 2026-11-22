@@ -3,12 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Crônicas Estelares — Editor</title>
-    <meta name="description" content="Editor de vídeo e sincronizador de timeline espacial para Crônicas Estelares." />
-    <meta property="og:title" content="Crônicas Estelares — Editor" />
-    <meta property="og:description" content="Editor de vídeo e sincronizador de timeline espacial para Crônicas Estelares." />
+    <title>SyncForge — Editor</title>
+    <meta name="description" content="SyncForge — Editor de vídeo e sincronizador de timeline com GPU." />
+    <meta property="og:title" content="SyncForge — Editor" />
+    <meta property="og:description" content="SyncForge — Editor de vídeo e sincronizador de timeline com GPU." />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
+    <link rel="icon" type="image/png" href="/images/Favicon.png" />
+    <link rel="shortcut icon" type="image/png" href="/images/Favicon.png" />
+    <link rel="apple-touch-icon" href="/images/Favicon.png" />
     <!-- Diagnóstico de erros caso algum módulo JS falhe -->
     <script>
       window.addEventListener('error', function(e) {
@@ -20,7 +23,7 @@
           box.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:#080d1a;color:#ff6b6b;padding:30px;font-family:monospace;font-size:14px;z-index:99999999;white-space:pre-wrap;line-height:1.6;overflow:auto;';
           document.body.appendChild(box);
         }
-        box.innerHTML = '<h3 style="color:#00d4ff;margin-bottom:12px;">Crônicas Estelares — Diagnóstico de Carregamento</h3>' +
+        box.innerHTML = '<h3 style="color:#00d4ff;margin-bottom:12px;">SyncForge — Diagnóstico de Carregamento</h3>' +
           '<div style="background:#04060f;padding:16px;border:1px solid #1a2a45;border-radius:6px;margin-bottom:16px;">' +
           '<strong>Erro:</strong> ' + (e.message || e) + '<br/>' +
           '<strong>Arquivo:</strong> ' + (e.filename || 'desconhecido') + ':' + (e.lineno || '') + '<br/>' +
@@ -37,8 +40,8 @@
   <body style="background: #04060f; color: #c8d8f0; margin: 0; padding: 0; height: 100vh; overflow: hidden;">
     <div id="root">
       <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;background:#04060f;color:#c8d8f0;font-family:'Exo 2',sans-serif;">
-        <div style="font-family:'Rajdhani',sans-serif;font-weight:700;font-size:22px;letter-spacing:3px;color:#00d4ff;margin-bottom:8px;">CRÔNICAS ESTELARES</div>
-        <div style="font-size:12px;color:#8aa8c8;font-family:'Share Tech Mono',monospace;">Inicializando editor espacial...</div>
+        <div style="font-family:'Rajdhani',sans-serif;font-weight:700;font-size:22px;letter-spacing:3px;color:#00d4ff;margin-bottom:8px;">SYNCFORGE</div>
+        <div style="font-size:12px;color:#8aa8c8;font-family:'Share Tech Mono',monospace;">Inicializando editor...</div>
       </div>
     </div>
     <script type="module" src="/src/main.tsx"></script>

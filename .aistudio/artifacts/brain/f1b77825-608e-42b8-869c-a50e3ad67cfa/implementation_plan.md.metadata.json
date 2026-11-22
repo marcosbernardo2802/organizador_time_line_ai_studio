@@ -1,6 +1,0 @@
-{
-  "summary":  "Plano de implementação para adicionar seletores de formato de tela (16:9, 9:16, 1:1), taxa de quadros (FPS: 24, 30, 60) e resolução (480p SD, 720p HD, 1080p Full HD, 1440p 2K, 2160p 4K) na barra de ferramentas ao lado dos botões Desfazer/Refazer, com adaptação dinâmica da moldura do player de vídeo e suporte no motor de renderização do Colab.",
-  "updatedAt":  "2026-10-23T18:17:09.292032392Z",
-  "requestFeedback":  true,
-  "userFacing":  true
-}

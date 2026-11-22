@@ -137,11 +137,183 @@ body {
   border-color: #e2e8f0;
   background: #f8fafc;
 }
+[data-theme="light"] .btn-gold {
+  background: #fffbeb;
+  color: #b45309;
+  border-color: #d97706;
+}
+[data-theme="light"] .btn-gold:hover:not(:disabled) {
+  background: #fef3c7;
+  color: #92400e;
+  box-shadow: 0 2px 8px rgba(217, 119, 6, 0.2);
+}
 .btn-danger {
   background: transparent; color: var(--danger);
   border: 1px solid rgba(224,64,64,0.4);
 }
 .btn-danger:hover:not(:disabled) { background: rgba(224,64,64,0.1); }
+
+/* ── Topbar / Title Bar Standardization ── */
+.topbar-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.topbar-divider {
+  width: 1px;
+  height: 20px;
+  background: var(--border);
+  margin: 0 4px;
+  flex-shrink: 0;
+  opacity: 0.75;
+}
+.topbar-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 11px;
+  border-radius: 4px;
+  font-family: 'Rajdhani', sans-serif;
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.4px;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  user-select: none;
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.topbar-btn:hover:not(:disabled) {
+  border-color: var(--accent2);
+  color: #ffffff;
+  background: rgba(0, 212, 255, 0.08);
+}
+.topbar-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.topbar-btn-icon {
+  padding: 0 9px;
+  min-width: 30px;
+}
+.topbar-btn-active {
+  background: rgba(45, 107, 228, 0.14);
+  border-color: var(--accent2);
+  color: var(--accent2);
+}
+.topbar-btn-motor-online {
+  background: rgba(34, 197, 94, 0.12);
+  border-color: #22c55e;
+  color: #4ade80;
+}
+.topbar-btn-motor-online:hover:not(:disabled) {
+  background: rgba(34, 197, 94, 0.2);
+  border-color: #4ade80;
+  color: #86efac;
+}
+.topbar-btn-motor-offline {
+  background: rgba(239, 68, 68, 0.1);
+  border-color: rgba(239, 68, 68, 0.45);
+  color: #fca5a5;
+}
+.topbar-btn-motor-offline:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.18);
+  border-color: #ef4444;
+  color: #fecaca;
+}
+.topbar-btn-gold {
+  background: rgba(240, 165, 0, 0.1);
+  border-color: var(--gold);
+  color: var(--gold);
+  font-weight: 700;
+}
+.topbar-btn-gold:hover:not(:disabled) {
+  background: rgba(240, 165, 0, 0.2);
+  border-color: #fbbf24;
+  color: #fde68a;
+  box-shadow: 0 0 12px rgba(240, 165, 0, 0.25);
+}
+.topbar-btn-primary {
+  background: var(--accent);
+  border-color: rgba(45, 107, 228, 0.8);
+  color: #ffffff;
+  font-weight: 700;
+}
+.topbar-btn-primary:hover:not(:disabled) {
+  background: #3d7bf0;
+  border-color: var(--accent2);
+  color: #ffffff;
+  box-shadow: 0 0 14px rgba(45, 107, 228, 0.45);
+}
+
+/* Light Mode Overrides for Topbar */
+[data-theme="light"] .topbar-btn {
+  background: #ffffff;
+  color: #1e293b;
+  border-color: #cbd5e1;
+}
+[data-theme="light"] .topbar-btn:hover:not(:disabled) {
+  background: #f0f9ff;
+  color: #0284c7;
+  border-color: #0284c7;
+}
+[data-theme="light"] .topbar-btn-active {
+  background: #f0f9ff;
+  border-color: #0284c7;
+  color: #0284c7;
+  font-weight: 700;
+}
+[data-theme="light"] .topbar-btn-motor-online {
+  background: #f0fdf4;
+  border-color: #16a34a;
+  color: #15803d;
+  font-weight: 700;
+}
+[data-theme="light"] .topbar-btn-motor-online:hover:not(:disabled) {
+  background: #dcfce7;
+  border-color: #15803d;
+  color: #14532d;
+}
+[data-theme="light"] .topbar-btn-motor-offline {
+  background: #fef2f2;
+  border-color: #ef4444;
+  color: #b91c1c;
+  font-weight: 700;
+}
+[data-theme="light"] .topbar-btn-motor-offline:hover:not(:disabled) {
+  background: #fee2e2;
+  border-color: #dc2626;
+  color: #991b1b;
+}
+[data-theme="light"] .topbar-btn-gold {
+  background: #fffbeb;
+  border-color: #d97706;
+  color: #b45309;
+  font-weight: 700;
+}
+[data-theme="light"] .topbar-btn-gold:hover:not(:disabled) {
+  background: #fef3c7;
+  border-color: #b45309;
+  color: #92400e;
+  box-shadow: 0 2px 6px rgba(217, 119, 6, 0.18);
+}
+[data-theme="light"] .topbar-btn-primary {
+  background: #2563eb;
+  border-color: #1d4ed8;
+  color: #ffffff;
+  font-weight: 700;
+}
+[data-theme="light"] .topbar-btn-primary:hover:not(:disabled) {
+  background: #1d4ed8;
+  border-color: #1e40af;
+  color: #ffffff;
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.3);
+}
 
 /* ── Modal ── */
 .modal-overlay {

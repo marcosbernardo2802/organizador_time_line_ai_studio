@@ -1,0 +1,10 @@
+Pasta de imagens do SyncForge (servida automaticamente em /images/)
+
+Para configurar o favicon e a logo da barra de título, basta colocar seus arquivos aqui com um dos seguintes nomes:
+
+1. Favicon (ícone da aba do navegador):
+   - favicon.png  (ou favicon.ico / favicon.svg)
+
+2. Logo da barra de título (cabeçalho do editor):
+   - logo.png     (ou logo.svg / logo.webp)
+   * Altura recomendada na barra de título: 24px a 28px (formato quadrado ou horizontal com fundo transparente).

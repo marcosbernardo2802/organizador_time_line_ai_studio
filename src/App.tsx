@@ -35,7 +35,7 @@ import { Timeline } from './components/Timeline/Timeline';
 import { SendToMotorModal } from './components/Modals/SendToMotorModal';
 import { ExportModal } from './components/Modals/ExportModal';
 import { MotorNgrokModal } from './components/Modals/MotorNgrokModal';
-import { motorApi, MotorStatusInfo, FormatoRender, QualidadeRender, FpsOpcao } from './services/motorApi';
+import { motorApi, MotorStatusInfo, FormatoRender, QualidadeRender, FpsOpcao, MotorRender } from './services/motorApi';
 import { localWorkspace } from './services/localWorkspace';
 import { limpaThumbnailsExceto, pausaThumbnails } from './utils/thumbnails';
 import { limpaWaveformsExceto, pausaWaveform } from './utils/waveform';
@@ -44,6 +44,7 @@ export default function App() {
   // Motor GPU (ngrok) & Workspace
   const [motorOnline, setMotorOnline] = useState<boolean>(false);
   const [motorGpu, setMotorGpu] = useState<string>('');
+  const [motorInfo, setMotorInfo] = useState<MotorStatusInfo | null>(null);
   const [workspaceName, setWorkspaceName] = useState<string | null>(() => localWorkspace.getActiveFolderName());
 
   // Formato de aspect ratio, FPS e resolução configurados
@@ -196,6 +197,7 @@ export default function App() {
     const checkMotor = async () => {
       const res = await motorApi.testConnection();
       setMotorOnline(res.online);
+      setMotorInfo(res);
       if (res.online && res.gpu) {
         setMotorGpu(res.gpu);
       }
@@ -204,6 +206,19 @@ export default function App() {
     const interval = setInterval(checkMotor, 15000);
     return () => clearInterval(interval);
   }, []);
+
+  // Atualiza diagnóstico de GPU/OpenGL ao abrir o modal de exportação
+  useEffect(() => {
+    if (modal === 'export') {
+      motorApi.testConnection().then((res) => {
+        setMotorOnline(res.online);
+        setMotorInfo(res);
+        if (res.online && res.gpu) {
+          setMotorGpu(res.gpu);
+        }
+      });
+    }
+  }, [modal]);
 
   // ── SELECIONAR PASTA LOCAL DO PC (WORKSPACE) ──────────────────────────────
   const handlePickWorkspace = async () => {
@@ -1572,6 +1587,7 @@ export default function App() {
         onClose={() => setModal(null)}
         renderState={renderState}
         motorOnline={motorOnline}
+        motorInfo={motorInfo}
         onOpenMotorModal={() => setModal('motor')}
         initialFormato={formato}
         initialQualidade={qualidade}
@@ -1585,26 +1601,39 @@ export default function App() {
           a.download = 'projeto_cronicas.json';
           a.click();
         }}
-        onRenderColab={async (opcoes: { formato: FormatoRender; qualidade: QualidadeRender; fps?: FpsOpcao }) => {
+        onRenderColab={async (opcoes: { formato: FormatoRender; qualidade: QualidadeRender; fps?: FpsOpcao; motorRender: MotorRender }) => {
           const videoClips = clips
             .filter((c) => c.trackId === 'video-1')
             .sort((a, b) => a.startTime - b.startTime);
           const narClip = clips.find((c) => c.trackId === 'audio-1');
           const bgmClip = clips.find((c) => c.trackId === 'audio-2');
           if (videoClips.length === 0) {
-            alert('Nenhuma imagem na timeline.');
+            setRenderState({ isRendering: false, progress: 0, status: '', error: 'Nenhuma imagem ou vídeo na timeline.' });
             return;
           }
 
           const narMedia = narClip ? library.find((m) => m.id === narClip.mediaId) : null;
           if (!narMedia?.url) {
-            alert('⚠️ Nenhum áudio de narração na timeline.\nAdicione o áudio na faixa Narração antes de renderizar.');
+            setRenderState({
+              isRendering: false,
+              progress: 0,
+              status: '',
+              error: 'Nenhum áudio de narração na timeline.\nAdicione o áudio na faixa Narração antes de renderizar.',
+            });
             return;
           }
 
           if (motorOnline) {
             // Mantém o modal aberto e com feedback em tempo real
-            setRenderState({ isRendering: true, progress: 5, status: 'Preparando arquivos para envio à GPU do Colab...' });
+            setRenderState({
+              isRendering: true,
+              progress: 5,
+              status:
+                opcoes.motorRender === 'opengl'
+                  ? 'Preparando arquivos para envio ao GPU Studio (OpenGL)...'
+                  : 'Preparando arquivos para envio à GPU do Colab...',
+              error: undefined,
+            });
 
             try {
               const filesToSend: File[] = [];
@@ -1774,16 +1803,19 @@ export default function App() {
                 notificaConclusao('Vídeo renderizado', 'O vídeo está pronto para download.');
 
                 const fpsInfo = opcoes.fps ? ` ${opcoes.fps}fps` : '';
+                const motorInfoLabel = opcoes.motorRender === 'opengl' ? ' · GPU Studio OpenGL' : '';
                 setRenderState({
                   isRendering: false,
                   progress: 100,
-                  status: `✅ Vídeo (${opcoes.formato} ${opcoes.qualidade}${fpsInfo}) renderizado pela GPU com sucesso! O download foi iniciado.`,
+                  status: `✅ Vídeo (${opcoes.formato} ${opcoes.qualidade}${fpsInfo}${motorInfoLabel}) renderizado com sucesso! O download foi iniciado.`,
+                  error: undefined,
                 });
               }
             } catch (err: any) {
-              notificaConclusao('Erro na renderização', err.message || 'Falha ao renderizar vídeo na GPU.');
-              setRenderState({ isRendering: false, progress: 0, status: `Erro na GPU: ${err.message}` });
-              alert(`Erro na renderização da GPU: ${err.message}`);
+              const errMsg = err?.message || 'Falha ao renderizar vídeo na GPU.';
+              notificaConclusao('Erro na renderização', errMsg);
+              setRenderState({ isRendering: false, progress: 0, status: '', error: errMsg });
+              setModal('export');
             }
             return;
           }

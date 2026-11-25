@@ -37,6 +37,7 @@ export interface ClipItem {
 export type FormatoRender = '16:9' | '9:16' | '1:1';
 export type QualidadeRender = '480p' | '720p' | '1080p' | '1440p' | '2160p';
 export type FpsOpcao = 24 | 30 | 60;
+export type MotorRender = 'ffmpeg' | 'opengl';
 
 export interface EtapaJob {
   id: string;
@@ -48,6 +49,7 @@ export interface RenderState {
   isRendering: boolean;
   progress: number;
   status: string;
+  error?: string;
   // Campos opcionais para progresso real por etapa
   etapas?: EtapaJob[];
   detalhe?: string;

@@ -1,14 +1,19 @@
 // Serviço de integração direta com o Motor de Dobra 4.2 AI Studio (via túnel ngrok)
 
 // Tipos de formato de aspecto, qualidade e FPS para renderização no Colab
-import { EtapaJob, FormatoRender, QualidadeRender, FpsOpcao } from '../types';
-export type { FormatoRender, QualidadeRender, FpsOpcao };
+import { EtapaJob, FormatoRender, QualidadeRender, FpsOpcao, MotorRender } from '../types';
+export type { FormatoRender, QualidadeRender, FpsOpcao, MotorRender };
 
 export interface MotorStatusInfo {
   online: boolean;
   motor?: string;
   versao?: string;
   gpu?: string;
+  gpu_ativa?: boolean;
+  opengl_disponivel?: boolean;
+  opengl_motivo?: string | null;
+  nvenc_disponivel?: boolean;
+  motores_disponiveis?: string[];
   whisper_model?: string;
   error?: string;
 }
@@ -105,6 +110,11 @@ export const motorApi = {
         motor: data.motor || 'Motor de Dobra 4.2',
         versao: data.versao || '4.2',
         gpu: data.gpu || 'GPU Ativa',
+        gpu_ativa: typeof data.gpu_ativa === 'boolean' ? data.gpu_ativa : undefined,
+        opengl_disponivel: typeof data.opengl_disponivel === 'boolean' ? data.opengl_disponivel : undefined,
+        opengl_motivo: data.opengl_motivo ?? null,
+        nvenc_disponivel: typeof data.nvenc_disponivel === 'boolean' ? data.nvenc_disponivel : undefined,
+        motores_disponiveis: Array.isArray(data.motores_disponiveis) ? data.motores_disponiveis : undefined,
         whisper_model: data.whisper_model || 'medium',
       };
     } catch (err: any) {
@@ -124,7 +134,13 @@ export const motorApi = {
     files: File[],
     tipo: 'timeline' | 'render' | 'timeline_e_render' = 'timeline',
     onProgress?: (mensagem: string, progresso: number, status?: JobStatusResponse) => void,
-    opcoes?: { formato?: FormatoRender; qualidade?: QualidadeRender; fps?: FpsOpcao; ignorarCache?: boolean }
+    opcoes?: {
+      formato?: FormatoRender;
+      qualidade?: QualidadeRender;
+      fps?: FpsOpcao;
+      motorRender?: MotorRender;
+      ignorarCache?: boolean;
+    }
   ): Promise<{ job_id: string; timeline?: any; videoBlob?: Blob | null }> {
     let base = this.getUrl();
     if (!base) {
@@ -147,7 +163,7 @@ export const motorApi = {
 
     const formData = new FormData();
     formData.append('tipo', tipo);
-    // Anexa formato, qualidade e FPS de renderização para o Colab se definidos
+    // Anexa formato, qualidade, FPS e motor de renderização para o Colab se definidos
     if (opcoes?.formato) {
       formData.append('formato', opcoes.formato);
     }
@@ -156,6 +172,9 @@ export const motorApi = {
     }
     if (opcoes?.fps) {
       formData.append('fps', String(opcoes.fps));
+    }
+    if (opcoes?.motorRender) {
+      formData.append('motor_render', opcoes.motorRender);
     }
     if (opcoes?.ignorarCache) {
       formData.append('ignorar_cache', '1');

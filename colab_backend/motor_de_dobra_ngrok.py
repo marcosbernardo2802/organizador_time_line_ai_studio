@@ -27,18 +27,24 @@ USAR_CACHE_TRANSCRICAO = True  # @param {type:"boolean"}
 # ==============================================================================
 import sys, subprocess
 
-print("📦 Instalando dependências (FastAPI, Uvicorn, pyngrok, Whisper, MoviePy)...")
+print("📦 Instalando dependências (FastAPI, Uvicorn, pyngrok, Whisper, MoviePy, ModernGL, Pillow)...")
 subprocess.run([
     sys.executable, "-m", "pip", "install",
     "fastapi", "uvicorn", "pyngrok", "python-multipart",
-    "openai-whisper", "moviepy", "tqdm", "-q"
+    "openai-whisper", "moviepy", "tqdm", "moderngl", "Pillow", "numpy", "-q"
 ], check=True)
 
-import os, re, unicodedata, whisper, threading, time, json, shutil, tempfile, uuid, hashlib
+import os, re, unicodedata, whisper, threading, time, json, shutil, tempfile, uuid, hashlib, struct, math
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import List, Optional
 import torch
+import numpy as np
+from PIL import Image, ImageOps
+try:
+    import moderngl
+except Exception:
+    moderngl = None
 
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -143,6 +149,21 @@ PLANOS_ETAPAS = {
         {"id": "cortes", "nome": "Renderizando cenas", "peso": 55, "etapa_legada": "render"},
         {"id": "concatenacao", "nome": "Unindo cenas", "peso": 3, "etapa_legada": "render"},
         {"id": "mixagem", "nome": "Mixando áudio e gerando MP4", "peso": 8, "etapa_legada": "render"},
+        {"id": "finalizacao", "nome": "Gerando timeline", "peso": 2, "etapa_legada": "render"},
+    ],
+    "render_opengl_com_timeline": [
+        {"id": "preparo", "nome": "Validando GPU OpenGL e arquivos", "peso": 4, "etapa_legada": "inicio"},
+        {"id": "audio_ambiente", "nome": "Preparando áudio dos clipes MP4", "peso": 6, "etapa_legada": "render"},
+        {"id": "render_gpu", "nome": "Renderizando na GPU (OpenGL + GLSL)", "peso": 80, "etapa_legada": "render"},
+        {"id": "mixagem", "nome": "Mixando áudio e validando MP4", "peso": 10, "etapa_legada": "render"},
+    ],
+    "timeline_e_render_opengl": [
+        {"id": "preparo", "nome": "Validando GPU OpenGL e arquivos", "peso": 2, "etapa_legada": "inicio"},
+        {"id": "transcricao", "nome": "Transcrevendo áudio (Whisper)", "peso": 25, "etapa_legada": "whisper"},
+        {"id": "sincronizacao", "nome": "Sincronizando roteiro e cenas", "peso": 5, "etapa_legada": "matching"},
+        {"id": "audio_ambiente", "nome": "Preparando áudio dos clipes MP4", "peso": 5, "etapa_legada": "render"},
+        {"id": "render_gpu", "nome": "Renderizando na GPU (OpenGL + GLSL)", "peso": 53, "etapa_legada": "render"},
+        {"id": "mixagem", "nome": "Mixando áudio e validando MP4", "peso": 8, "etapa_legada": "render"},
         {"id": "finalizacao", "nome": "Gerando timeline", "peso": 2, "etapa_legada": "render"},
     ],
 }
@@ -1255,6 +1276,1511 @@ def renderiza_video(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4,
 
 
 # ==============================================================================
+# 4B. MOTOR GPU STUDIO (MODERNGL + 33 TRANSIÇÕES GLSL + 10 FILTROS + NVENC)
+# ==============================================================================
+# Pipeline alternativo 100% isolado do motor FFmpeg 4.2 acima.
+# Só é acionado quando motor_render == "opengl" (selecionado explicitamente na UI).
+# Se a GPU estiver desligada no Colab ou o OpenGL/EGL falhar, interrompe com
+# diagnóstico claro em português (sem fallback silencioso para FFmpeg).
+
+_CACHE_DIAG_GPU_OPENGL = None
+_LOCK_DIAG_GPU_OPENGL = threading.Lock()
+
+OPENGL_FIT_MAP = {
+    "contain": 0,
+    "cover": 1,
+    "blur": 2,
+}
+
+OPENGL_EFFECT_MAP = {
+    "none": 0,
+    "kenburns": 1,
+    "zoom_in": 2,
+    "zoom_out": 3,
+    "pan_right": 4,
+    "pan_left": 5,
+}
+
+OPENGL_FILTER_MAP = {
+    "none": 0,
+    "grayscale": 1,
+    "sepia": 2,
+    "blur": 3,
+    "contrast": 4,
+    "saturate": 5,
+    "vignette": 6,
+    "invert": 7,
+    "huerotate": 8,
+    "grain": 9,
+}
+
+OPENGL_TRANSITION_MAP = {
+    "none": 0,
+    "dissolve": 1,
+    "fadeblack": 2,
+    "fadewhite": 3,
+    "crossfade": 4,
+    "pixelize": 5,
+    "radial": 6,
+    "slideleft": 7,
+    "slideright": 8,
+    "slideup": 9,
+    "slidedown": 10,
+    "smoothleft": 11,
+    "smoothright": 12,
+    "smoothup": 13,
+    "smoothdown": 14,
+    "wipeleft": 15,
+    "wiperight": 16,
+    "wipeup": 17,
+    "wipedown": 18,
+    "diagtl": 19,
+    "diagtr": 20,
+    "diagbl": 21,
+    "diagbr": 22,
+    "circleopen": 23,
+    "circleclose": 24,
+    "horzopen": 25,
+    "horzclose": 26,
+    "vertopen": 27,
+    "vertclose": 28,
+    "hlslice": 29,
+    "hrslice": 30,
+    "vuslice": 31,
+    "vdslice": 32,
+}
+
+_QUAD_VERTEX_SHADER = """
+#version 330 core
+in vec2 in_pos;
+in vec2 in_uv;
+out vec2 v_uv;
+void main() {
+    gl_Position = vec4(in_pos, 0.0, 1.0);
+    v_uv = in_uv;
+}
+"""
+
+_SCENE_FRAGMENT_SHADER = """
+#version 330 core
+uniform sampler2D u_tex;
+uniform vec2 u_src_size;
+uniform vec2 u_dst_size;
+uniform int u_fit_mode;
+uniform int u_effect_mode;
+uniform float u_progress;
+uniform int u_filter_mode;
+uniform float u_filter_intensity;
+uniform float u_time;
+
+in vec2 v_uv;
+out vec4 fragColor;
+
+vec2 apply_camera_uv(vec2 uv, int mode, float p) {
+    float s = p * p * (3.0 - 2.0 * p);
+    float t = mix(p, s, 0.35);
+    vec2 centered = uv - vec2(0.5, 0.5);
+    if (mode == 1) {
+        // kenburns: zoom suave + pan diagonal sutil
+        float scale = mix(1.0, 1.13, t);
+        vec2 pan = mix(vec2(-0.022, -0.012), vec2(0.022, 0.012), t);
+        return clamp((centered / scale) + vec2(0.5, 0.5) + pan, vec2(0.0), vec2(1.0));
+    } else if (mode == 2) {
+        // zoom_in
+        float scale = mix(1.0, 1.18, t);
+        return clamp((centered / scale) + vec2(0.5, 0.5), vec2(0.0), vec2(1.0));
+    } else if (mode == 3) {
+        // zoom_out
+        float scale = mix(1.18, 1.0, t);
+        return clamp((centered / scale) + vec2(0.5, 0.5), vec2(0.0), vec2(1.0));
+    } else if (mode == 4) {
+        // pan_right (enquadramento com zoom leve para nunca expor bordas)
+        float scale = 1.14;
+        float offset_x = mix(-0.055, 0.055, t);
+        return clamp((centered / scale) + vec2(0.5 + offset_x, 0.5), vec2(0.0), vec2(1.0));
+    } else if (mode == 5) {
+        // pan_left
+        float scale = 1.14;
+        float offset_x = mix(0.055, -0.055, t);
+        return clamp((centered / scale) + vec2(0.5 + offset_x, 0.5), vec2(0.0), vec2(1.0));
+    }
+    return uv;
+}
+
+vec2 cover_uv(vec2 uv, float src_aspect, float dst_aspect) {
+    vec2 out_uv = uv;
+    if (src_aspect > dst_aspect) {
+        float scale = dst_aspect / src_aspect;
+        out_uv.x = (uv.x - 0.5) * scale + 0.5;
+    } else {
+        float scale = src_aspect / dst_aspect;
+        out_uv.y = (uv.y - 0.5) * scale + 0.5;
+    }
+    return out_uv;
+}
+
+vec2 contain_uv(vec2 uv, float src_aspect, float dst_aspect) {
+    vec2 out_uv = uv;
+    if (src_aspect > dst_aspect) {
+        float scale = src_aspect / dst_aspect;
+        out_uv.y = (uv.y - 0.5) * scale + 0.5;
+    } else {
+        float scale = dst_aspect / src_aspect;
+        out_uv.x = (uv.x - 0.5) * scale + 0.5;
+    }
+    return out_uv;
+}
+
+vec3 sample_blur_bg(vec2 uv, vec2 texel) {
+    vec3 acc = vec3(0.0);
+    float wsum = 0.0;
+    for (int dx = -2; dx <= 2; dx++) {
+        for (int dy = -2; dy <= 2; dy++) {
+            float d2 = float(dx * dx + dy * dy);
+            float w = exp(-d2 * 0.28);
+            vec2 off = vec2(float(dx), float(dy)) * texel * 6.0;
+            acc += texture(u_tex, clamp(uv + off, vec2(0.001), vec2(0.999))).rgb * w;
+            wsum += w;
+        }
+    }
+    return (acc / max(wsum, 0.0001)) * 0.62;
+}
+
+vec3 sample_scene_raw(vec2 uv) {
+    float src_aspect = u_src_size.x / max(u_src_size.y, 1.0);
+    float dst_aspect = u_dst_size.x / max(u_dst_size.y, 1.0);
+
+    if (u_fit_mode == 1) {
+        // cover
+        vec2 cam_uv = apply_camera_uv(uv, u_effect_mode, u_progress);
+        vec2 c_uv = cover_uv(cam_uv, src_aspect, dst_aspect);
+        return texture(u_tex, clamp(c_uv, vec2(0.0), vec2(1.0))).rgb;
+    } else if (u_fit_mode == 2) {
+        // blur: fundo cover desfocado + primeiro plano contain nítido
+        vec2 ct_uv = contain_uv(uv, src_aspect, dst_aspect);
+        if (ct_uv.x >= 0.0 && ct_uv.x <= 1.0 && ct_uv.y >= 0.0 && ct_uv.y <= 1.0) {
+            vec2 cam_ct = apply_camera_uv(ct_uv, u_effect_mode, u_progress);
+            return texture(u_tex, clamp(cam_ct, vec2(0.0), vec2(1.0))).rgb;
+        } else {
+            vec2 bg_uv = cover_uv(uv, src_aspect, dst_aspect);
+            vec2 texel = vec2(1.0) / max(u_src_size, vec2(1.0));
+            return sample_blur_bg(bg_uv, texel);
+        }
+    } else {
+        // contain (padrão)
+        vec2 ct_uv = contain_uv(uv, src_aspect, dst_aspect);
+        if (ct_uv.x < 0.0 || ct_uv.x > 1.0 || ct_uv.y < 0.0 || ct_uv.y > 1.0) {
+            return vec3(0.0);
+        }
+        vec2 cam_ct = apply_camera_uv(ct_uv, u_effect_mode, u_progress);
+        return texture(u_tex, clamp(cam_ct, vec2(0.0), vec2(1.0))).rgb;
+    }
+}
+
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+vec3 hue_rotate_rgb(vec3 col, float angle) {
+    float c = cos(angle);
+    float s = sin(angle);
+    vec3 k = vec3(0.577350269);
+    return col * c + cross(k, col) * s + k * dot(k, col) * (1.0 - c);
+}
+
+void main() {
+    float inten = clamp(u_filter_intensity, 0.0, 1.0);
+    vec3 col;
+
+    if (u_filter_mode == 3 && inten > 0.001) {
+        // blur filter (multi-tap em espaço de tela)
+        vec2 px = vec2(1.0) / max(u_dst_size, vec2(1.0));
+        float rad = mix(0.0, 4.5, inten);
+        vec3 acc = vec3(0.0);
+        float wsum = 0.0;
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dy = -2; dy <= 2; dy++) {
+                float d2 = float(dx * dx + dy * dy);
+                float w = exp(-d2 * 0.32);
+                vec2 off = vec2(float(dx), float(dy)) * px * rad;
+                acc += sample_scene_raw(clamp(v_uv + off, vec2(0.0), vec2(1.0))) * w;
+                wsum += w;
+            }
+        }
+        col = acc / max(wsum, 0.0001);
+    } else {
+        col = sample_scene_raw(v_uv);
+    }
+
+    if (inten > 0.001) {
+        if (u_filter_mode == 1) {
+            // grayscale
+            float l = dot(col, vec3(0.2126, 0.7152, 0.0722));
+            col = mix(col, vec3(l), inten);
+        } else if (u_filter_mode == 2) {
+            // sepia
+            vec3 sep = vec3(
+                dot(col, vec3(0.393, 0.769, 0.189)),
+                dot(col, vec3(0.349, 0.686, 0.168)),
+                dot(col, vec3(0.272, 0.534, 0.131))
+            );
+            col = mix(col, clamp(sep, 0.0, 1.0), inten);
+        } else if (u_filter_mode == 4) {
+            // contrast
+            float factor = 1.0 + 0.75 * inten;
+            col = clamp((col - 0.5) * factor + 0.5, 0.0, 1.0);
+        } else if (u_filter_mode == 5) {
+            // saturate
+            float l = dot(col, vec3(0.2126, 0.7152, 0.0722));
+            col = clamp(mix(vec3(l), col, 1.0 + 1.25 * inten), 0.0, 1.0);
+        } else if (u_filter_mode == 6) {
+            // vignette
+            vec2 d = v_uv - vec2(0.5, 0.5);
+            float dist = length(d * vec2(1.15, 1.15));
+            float vig = smoothstep(0.32, 0.92, dist);
+            col *= (1.0 - vig * 0.78 * inten);
+        } else if (u_filter_mode == 7) {
+            // invert
+            col = mix(col, vec3(1.0) - col, inten);
+        } else if (u_filter_mode == 8) {
+            // huerotate
+            col = clamp(hue_rotate_rgb(col, inten * 3.14159265), 0.0, 1.0);
+        } else if (u_filter_mode == 9) {
+            // grain (animado por frame)
+            float n = hash12(v_uv * u_dst_size + vec2(floor(u_time * 30.0) * 17.3, floor(u_time * 30.0) * 43.7));
+            float g = (n - 0.5) * 0.24 * inten;
+            col = clamp(col + vec3(g), 0.0, 1.0);
+        }
+    }
+
+    fragColor = vec4(clamp(col, 0.0, 1.0), 1.0);
+}
+"""
+
+_TRANSITION_FRAGMENT_SHADER = """
+#version 330 core
+uniform sampler2D u_from;
+uniform sampler2D u_to;
+uniform float u_progress;
+uniform int u_trans_mode;
+uniform vec2 u_resolution;
+
+in vec2 v_uv;
+out vec4 fragColor;
+
+const float PI = 3.14159265359;
+
+vec4 getFrom(vec2 uv) {
+    return texture(u_from, clamp(uv, vec2(0.0), vec2(1.0)));
+}
+
+vec4 getTo(vec2 uv) {
+    return texture(u_to, clamp(uv, vec2(0.0), vec2(1.0)));
+}
+
+void main() {
+    float p = clamp(u_progress, 0.0, 1.0);
+    float sp = p * p * (3.0 - 2.0 * p);
+    vec2 uv = v_uv;
+    float aspect = u_resolution.x / max(u_resolution.y, 1.0);
+    vec4 col = getTo(uv);
+
+    if (u_trans_mode == 0) {
+        // none (corte seco)
+        col = getTo(uv);
+    } else if (u_trans_mode == 1) {
+        // dissolve
+        col = mix(getFrom(uv), getTo(uv), p);
+    } else if (u_trans_mode == 2) {
+        // fadeblack
+        if (p < 0.5) {
+            col = mix(getFrom(uv), vec4(0.0, 0.0, 0.0, 1.0), smoothstep(0.0, 0.5, p));
+        } else {
+            col = mix(vec4(0.0, 0.0, 0.0, 1.0), getTo(uv), smoothstep(0.5, 1.0, p));
+        }
+    } else if (u_trans_mode == 3) {
+        // fadewhite
+        if (p < 0.5) {
+            col = mix(getFrom(uv), vec4(1.0, 1.0, 1.0, 1.0), smoothstep(0.0, 0.5, p));
+        } else {
+            col = mix(vec4(1.0, 1.0, 1.0, 1.0), getTo(uv), smoothstep(0.5, 1.0, p));
+        }
+    } else if (u_trans_mode == 4) {
+        // crossfade suave
+        col = mix(getFrom(uv), getTo(uv), sp);
+    } else if (u_trans_mode == 5) {
+        // pixelize
+        float intensity = sin(p * PI);
+        float squares = mix(240.0, 14.0, intensity);
+        vec2 grid = vec2(max(squares * aspect, 4.0), max(squares, 4.0));
+        vec2 puv = (floor(uv * grid) + vec2(0.5)) / grid;
+        col = mix(getFrom(puv), getTo(puv), sp);
+    } else if (u_trans_mode == 6) {
+        // radial (varredura relógio a partir do topo)
+        vec2 rp = uv - vec2(0.5, 0.5);
+        float a = atan(rp.x, -rp.y); // -PI..PI, 0 no topo
+        float norm_a = fract(a / (2.0 * PI));
+        float m = smoothstep(p - 0.015, p + 0.015, norm_a);
+        col = mix(getTo(uv), getFrom(uv), m);
+    } else if (u_trans_mode == 7) {
+        // slideleft (entra da direita empurrando para esquerda)
+        float b = 1.0 - sp;
+        if (uv.x < b) {
+            col = getFrom(vec2(uv.x + sp, uv.y));
+        } else {
+            col = getTo(vec2(uv.x - b, uv.y));
+        }
+    } else if (u_trans_mode == 8) {
+        // slideright (entra da esquerda empurrando para direita)
+        float b = sp;
+        if (uv.x < b) {
+            col = getTo(vec2(uv.x + 1.0 - sp, uv.y));
+        } else {
+            col = getFrom(vec2(uv.x - sp, uv.y));
+        }
+    } else if (u_trans_mode == 9) {
+        // slideup (entra de baixo empurrando para cima)
+        float b = 1.0 - sp;
+        if (uv.y < b) {
+            col = getFrom(vec2(uv.x, uv.y + sp));
+        } else {
+            col = getTo(vec2(uv.x, uv.y - b));
+        }
+    } else if (u_trans_mode == 10) {
+        // slidedown (entra de cima empurrando para baixo)
+        float b = sp;
+        if (uv.y < b) {
+            col = getTo(vec2(uv.x, uv.y + 1.0 - sp));
+        } else {
+            col = getFrom(vec2(uv.x, uv.y - sp));
+        }
+    } else if (u_trans_mode == 11) {
+        // smoothleft
+        float edge = 1.0 - sp;
+        float m = smoothstep(edge - 0.14, edge + 0.14, uv.x);
+        col = mix(getFrom(vec2(uv.x + sp * 0.25, uv.y)), getTo(vec2(uv.x - (1.0 - sp) * 0.25, uv.y)), m);
+    } else if (u_trans_mode == 12) {
+        // smoothright
+        float edge = sp;
+        float m = 1.0 - smoothstep(edge - 0.14, edge + 0.14, uv.x);
+        col = mix(getFrom(vec2(uv.x - sp * 0.25, uv.y)), getTo(vec2(uv.x + (1.0 - sp) * 0.25, uv.y)), m);
+    } else if (u_trans_mode == 13) {
+        // smoothup
+        float edge = 1.0 - sp;
+        float m = smoothstep(edge - 0.14, edge + 0.14, uv.y);
+        col = mix(getFrom(vec2(uv.x, uv.y + sp * 0.25)), getTo(vec2(uv.x, uv.y - (1.0 - sp) * 0.25)), m);
+    } else if (u_trans_mode == 14) {
+        // smoothdown
+        float edge = sp;
+        float m = 1.0 - smoothstep(edge - 0.14, edge + 0.14, uv.y);
+        col = mix(getFrom(vec2(uv.x, uv.y - sp * 0.25)), getTo(vec2(uv.x, uv.y + (1.0 - sp) * 0.25)), m);
+    } else if (u_trans_mode == 15) {
+        // wipeleft
+        float m = smoothstep(1.0 - p - 0.008, 1.0 - p + 0.008, uv.x);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 16) {
+        // wiperight
+        float m = 1.0 - smoothstep(p - 0.008, p + 0.008, uv.x);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 17) {
+        // wipeup
+        float m = smoothstep(1.0 - p - 0.008, 1.0 - p + 0.008, uv.y);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 18) {
+        // wipedown
+        float m = 1.0 - smoothstep(p - 0.008, p + 0.008, uv.y);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 19) {
+        // diagtl (topo esquerdo -> baixo direito)
+        float d = (uv.x + uv.y) * 0.5;
+        float m = 1.0 - smoothstep(p - 0.015, p + 0.015, d);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 20) {
+        // diagtr (topo direito -> baixo esquerdo)
+        float d = ((1.0 - uv.x) + uv.y) * 0.5;
+        float m = 1.0 - smoothstep(p - 0.015, p + 0.015, d);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 21) {
+        // diagbl (baixo esquerdo -> topo direito)
+        float d = (uv.x + (1.0 - uv.y)) * 0.5;
+        float m = 1.0 - smoothstep(p - 0.015, p + 0.015, d);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 22) {
+        // diagbr (baixo direito -> topo esquerdo)
+        float d = ((1.0 - uv.x) + (1.0 - uv.y)) * 0.5;
+        float m = 1.0 - smoothstep(p - 0.015, p + 0.015, d);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 23) {
+        // circleopen (íris abrir do centro)
+        vec2 c = (uv - vec2(0.5, 0.5)) * vec2(aspect, 1.0);
+        float max_r = length(vec2(0.5 * aspect, 0.5)) + 0.02;
+        float r = sp * max_r;
+        float m = 1.0 - smoothstep(r - 0.015, r + 0.015, length(c));
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 24) {
+        // circleclose (íris fechar para o centro)
+        vec2 c = (uv - vec2(0.5, 0.5)) * vec2(aspect, 1.0);
+        float max_r = length(vec2(0.5 * aspect, 0.5)) + 0.02;
+        float r = (1.0 - sp) * max_r;
+        float m = smoothstep(r - 0.015, r + 0.015, length(c));
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 25) {
+        // horzopen (cortinas horizontais abrindo do centro)
+        float d = abs(uv.x - 0.5);
+        float m = 1.0 - smoothstep(sp * 0.5 - 0.008, sp * 0.5 + 0.008, d);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 26) {
+        // horzclose (cortinas horizontais fechando para o centro)
+        float d = abs(uv.x - 0.5);
+        float edge = (1.0 - sp) * 0.5;
+        float m = smoothstep(edge - 0.008, edge + 0.008, d);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 27) {
+        // vertopen (cortinas verticais abrindo do centro)
+        float d = abs(uv.y - 0.5);
+        float m = 1.0 - smoothstep(sp * 0.5 - 0.008, sp * 0.5 + 0.008, d);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 28) {
+        // vertclose (cortinas verticais fechando para o centro)
+        float d = abs(uv.y - 0.5);
+        float edge = (1.0 - sp) * 0.5;
+        float m = smoothstep(edge - 0.008, edge + 0.008, d);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 29) {
+        // hlslice (fatias horizontais varrendo para a esquerda)
+        float count = 8.0;
+        float idx = floor(uv.y * count);
+        float delay = (idx / count) * 0.45;
+        float local_p = clamp((p - delay) / 0.55, 0.0, 1.0);
+        float m = smoothstep(1.0 - local_p - 0.01, 1.0 - local_p + 0.01, uv.x);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 30) {
+        // hrslice (fatias horizontais varrendo para a direita)
+        float count = 8.0;
+        float idx = floor(uv.y * count);
+        float delay = (idx / count) * 0.45;
+        float local_p = clamp((p - delay) / 0.55, 0.0, 1.0);
+        float m = 1.0 - smoothstep(local_p - 0.01, local_p + 0.01, uv.x);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 31) {
+        // vuslice (fatias verticais varrendo para cima)
+        float count = 10.0;
+        float idx = floor(uv.x * count);
+        float delay = (idx / count) * 0.45;
+        float local_p = clamp((p - delay) / 0.55, 0.0, 1.0);
+        float m = smoothstep(1.0 - local_p - 0.01, 1.0 - local_p + 0.01, uv.y);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else if (u_trans_mode == 32) {
+        // vdslice (fatias verticais varrendo para baixo)
+        float count = 10.0;
+        float idx = floor(uv.x * count);
+        float delay = (idx / count) * 0.45;
+        float local_p = clamp((p - delay) / 0.55, 0.0, 1.0);
+        float m = 1.0 - smoothstep(local_p - 0.01, local_p + 0.01, uv.y);
+        col = mix(getFrom(uv), getTo(uv), m);
+    } else {
+        col = mix(getFrom(uv), getTo(uv), sp);
+    }
+
+    fragColor = vec4(clamp(col.rgb, 0.0, 1.0), 1.0);
+}
+"""
+
+
+def _set_uniform(prog, name: str, value):
+    if name in prog:
+        prog[name].value = value
+
+
+def _detecta_nvenc() -> bool:
+    """Testa rapidamente se o FFmpeg desta máquina Colab consegue codificar com h264_nvenc."""
+    try:
+        res = subprocess.run(
+            [
+                "ffmpeg", "-y", "-v", "error",
+                "-f", "lavfi", "-i", "color=black:s=64x64:d=0.1",
+                "-c:v", "h264_nvenc", "-f", "null", "-"
+            ],
+            capture_output=True,
+            text=True,
+            timeout=12,
+        )
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
+def _cria_contexto_opengl_headless():
+    """Cria contexto ModernGL headless via EGL (obrigatório em GPU Linux/Colab)."""
+    if moderngl is None:
+        raise RuntimeError("Biblioteca 'moderngl' não está instalada neste ambiente Python.")
+    try:
+        ctx = moderngl.create_standalone_context(backend="egl")
+    except Exception as e_egl:
+        # Tenta backend padrão apenas se uma GPU NVIDIA estiver ativa (algumas imagens expõem GLX/EGL implícito)
+        try:
+            ctx = moderngl.create_standalone_context()
+        except Exception as e_def:
+            raise RuntimeError(f"EGL: {e_egl} | Padrão: {e_def}") from e_def
+    ctx.pack_alignment = 1
+    ctx.unpack_alignment = 1
+    return ctx
+
+
+def diagnostico_gpu_opengl(force_refresh: bool = False) -> dict:
+    """
+    Diagnostica GPU CUDA, contexto ModernGL (OpenGL/EGL) e codificador FFmpeg NVENC.
+    Usado pelo endpoint /status e na validação estrita antes de rodar jobs 'opengl'.
+    """
+    global _CACHE_DIAG_GPU_OPENGL
+    with _LOCK_DIAG_GPU_OPENGL:
+        if _CACHE_DIAG_GPU_OPENGL is not None and not force_refresh:
+            return dict(_CACHE_DIAG_GPU_OPENGL)
+
+        gpu_ativa = False
+        gpu_nome = "CPU"
+        try:
+            if torch.cuda.is_available():
+                gpu_ativa = True
+                gpu_nome = torch.cuda.get_device_name(0)
+        except Exception:
+            pass
+
+        if not gpu_ativa:
+            try:
+                out_smi = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                ).strip()
+                if out_smi:
+                    gpu_ativa = True
+                    gpu_nome = out_smi.splitlines()[0].strip()
+            except Exception:
+                pass
+
+        opengl_ok = False
+        opengl_motivo = None
+        nvenc_ok = False
+
+        if not gpu_ativa:
+            opengl_motivo = (
+                "GPU não detectada no Google Colab (sessão atual rodando em CPU). "
+                "Ative em: Ambiente de execução → Alterar tipo de ambiente de execução → GPU T4/L4."
+            )
+        elif moderngl is None:
+            opengl_motivo = "Pacote 'moderngl' não encontrado no ambiente Python do Colab."
+        else:
+            try:
+                ctx_teste = _cria_contexto_opengl_headless()
+                ctx_teste.release()
+                opengl_ok = True
+            except Exception as e:
+                opengl_motivo = f"Falha ao inicializar OpenGL/EGL na GPU ({gpu_nome}): {e}"
+
+        if gpu_ativa:
+            nvenc_ok = _detecta_nvenc()
+
+        info = {
+            "gpu_ativa": gpu_ativa,
+            "gpu_nome": gpu_nome,
+            "opengl_disponivel": opengl_ok,
+            "opengl_motivo": opengl_motivo,
+            "nvenc_disponivel": nvenc_ok,
+        }
+        _CACHE_DIAG_GPU_OPENGL = info
+        return dict(info)
+
+
+def _verifica_gpu_opengl_obrigatorio() -> dict:
+    """
+    Validação estrita para o motor GPU Studio (OpenGL).
+    NUNCA faz fallback silencioso para FFmpeg: interrompe com mensagem clara explicando
+    se faltou ativar a GPU no Colab ou qual foi o erro do OpenGL/EGL.
+    """
+    diag = diagnostico_gpu_opengl(force_refresh=True)
+    if not diag["gpu_ativa"]:
+        raise RuntimeError(
+            "GPU não detectada no Google Colab (a sessão atual está rodando em CPU).\n\n"
+            "O motor GPU Studio (OpenGL) exige aceleração de GPU. Para ativar:\n"
+            "1. No Google Colab, abra o menu 'Ambiente de execução' → 'Alterar tipo de ambiente de execução'.\n"
+            "2. Escolha uma GPU (ex.: T4 GPU ou L4 GPU) e clique em Salvar.\n"
+            "3. Rode novamente a célula do servidor e atualize a URL do ngrok no SyncForge.\n\n"
+            "Dica: se quiser renderizar agora mesmo sem GPU, selecione o motor 'Padrão FFmpeg' no modal de exportação."
+        )
+    if not diag["opengl_disponivel"]:
+        detalhe = diag.get("opengl_motivo") or "Erro desconhecido ao criar contexto headless EGL."
+        raise RuntimeError(
+            f"Falha ao inicializar o motor GPU Studio (OpenGL) na GPU '{diag['gpu_nome']}'.\n\n"
+            f"Motivo técnico: {detalhe}\n\n"
+            "Sugestões:\n"
+            "• Reinicie o ambiente de execução do Colab e execute a célula novamente.\n"
+            "• Se o erro persistir nesta máquina Colab, selecione o motor 'Padrão FFmpeg' no modal de exportação."
+        )
+    return diag
+
+
+def _obtem_dimensoes_video(path: str):
+    """Retorna (width, height) do vídeo via ffprobe."""
+    try:
+        out = subprocess.check_output(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "csv=p=0:s=x",
+                path,
+            ],
+            text=True,
+            timeout=10,
+        ).strip()
+        if "x" in out:
+            w_s, h_s = out.splitlines()[0].split("x", 1)
+            w, h = int(w_s), int(h_s)
+            if w > 0 and h > 0:
+                return w, h
+    except Exception:
+        pass
+    return 1920, 1080
+
+
+class _VideoPipeReader:
+    """Decodifica um clipe MP4 frame-a-frame via FFmpeg em streaming RGB24 sem encher RAM."""
+    def __init__(self, video_path: str, fps: int, slow_factor: float, max_dim: int):
+        src_w, src_h = _obtem_dimensoes_video(video_path)
+        scale = min(1.0, float(max_dim) / float(max(src_w, src_h, 1)))
+        w = max(2, int(round(src_w * scale)) & ~1)
+        h = max(2, int(round(src_h * scale)) & ~1)
+
+        self.width = w
+        self.height = h
+        self.frame_bytes = w * h * 3
+        self.last_frame = None
+        self.eof = False
+
+        vf_parts = []
+        if slow_factor > 1.001:
+            vf_parts.append(f"setpts=(PTS-STARTPTS)*{slow_factor:.5f}")
+        else:
+            vf_parts.append("setpts=PTS-STARTPTS")
+        vf_parts.append(f"fps={fps}")
+        if w != src_w or h != src_h:
+            vf_parts.append(f"scale={w}:{h}:flags=bilinear")
+
+        cmd = [
+            "ffmpeg", "-v", "error",
+            "-i", video_path,
+            "-vf", ",".join(vf_parts),
+            "-an", "-sn", "-dn",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
+            "pipe:1",
+        ]
+        self.proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            bufsize=self.frame_bytes * 2,
+        )
+
+    def read_next_frame(self) -> bytes:
+        if not self.eof and self.proc and self.proc.stdout:
+            data = self.proc.stdout.read(self.frame_bytes)
+            if data and len(data) == self.frame_bytes:
+                self.last_frame = data
+                return data
+            self.eof = True
+        if self.last_frame is not None:
+            return self.last_frame
+        return bytes(self.frame_bytes)
+
+    def close(self):
+        if self.proc is not None:
+            try:
+                if self.proc.stdout:
+                    self.proc.stdout.close()
+            except Exception:
+                pass
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=2)
+            except Exception:
+                try:
+                    self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
+
+
+class _SceneTextureSource:
+    """
+    Gerencia a textura OpenGL em streaming de uma única cena (imagem, vídeo MP4,
+    vídeo + imagem complementar, vídeo com freeze do último frame ou fundo preto).
+    """
+    def __init__(self, ctx, scene_plan: dict, fps: int, dst_size: tuple):
+        self.ctx = ctx
+        self.plan = scene_plan
+        self.fps = fps
+        self.dst_size = dst_size
+        self.max_tex_dim = min(3840, max(dst_size[0], dst_size[1], 1080) * 2)
+
+        self.video_reader = None
+        self.video_tex = None
+        self.video_size = (2, 2)
+        self.image_tex = None
+        self.image_size = (2, 2)
+        self.black_tex = None
+        self.frames_decoded = 0
+
+        mode = scene_plan["mode"]
+        if mode in ("video", "video_freeze", "video_plus_image") and scene_plan.get("video_src"):
+            max_vid_dim = max(dst_size[0], dst_size[1])
+            self.video_reader = _VideoPipeReader(
+                scene_plan["video_src"],
+                fps=fps,
+                slow_factor=scene_plan.get("slow_factor", 1.0),
+                max_dim=max_vid_dim,
+            )
+            self.video_size = (self.video_reader.width, self.video_reader.height)
+            self.video_tex = ctx.texture(self.video_size, 3)
+            self.video_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self.video_tex.repeat_x = False
+            self.video_tex.repeat_y = False
+
+        if mode in ("image", "video_plus_image") and scene_plan.get("image_src"):
+            self.image_tex, self.image_size = self._load_image_texture(scene_plan["image_src"])
+
+        if mode == "black" or (self.video_tex is None and self.image_tex is None):
+            self.black_tex = ctx.texture((4, 4), 3, bytes(4 * 4 * 3))
+            self.black_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+
+    def _load_image_texture(self, image_path: str):
+        with Image.open(image_path) as im:
+            im = ImageOps.exif_transpose(im).convert("RGB")
+            w, h = im.size
+            if max(w, h) > self.max_tex_dim:
+                scale = float(self.max_tex_dim) / float(max(w, h))
+                nw = max(2, int(round(w * scale)))
+                nh = max(2, int(round(h * scale)))
+                im = im.resize((nw, nh), Image.Resampling.LANCZOS)
+                w, h = im.size
+            raw = im.tobytes()
+        tex = self.ctx.texture((w, h), 3, raw, alignment=1)
+        tex.build_mipmaps()
+        tex.filter = (moderngl.LINEAR_MIPMAP_LINEAR, moderngl.LINEAR)
+        tex.repeat_x = False
+        tex.repeat_y = False
+        return tex, (w, h)
+
+    def get_frame_state(self, local_frame: int):
+        """
+        Retorna (texture, src_size, effect_mode_int, progress_float) para o frame local da cena.
+        Suporta frames além de end_frame durante a janela de transição (continuação suave / freeze).
+        """
+        mode = self.plan["mode"]
+        total_scene_frames = max(1, self.plan["num_frames"])
+        base_effect = OPENGL_EFFECT_MAP.get(self.plan.get("effect", "none"), 0)
+
+        if mode == "video_plus_image" and self.video_reader is not None and self.image_tex is not None:
+            vid_frames = max(1, int(round(self.plan["dur_vid"] * self.fps)))
+            if local_frame < vid_frames:
+                while self.frames_decoded <= local_frame:
+                    frame_data = self.video_reader.read_next_frame()
+                    self.video_tex.write(frame_data, alignment=1)
+                    self.frames_decoded += 1
+                # Mantém paridade com Caso C do motor 4.2: vídeo inicial sem zoom artificial, imagem complementar com efeito
+                prog = min(1.0, max(0.0, float(local_frame) / float(max(1, vid_frames - 1))))
+                return self.video_tex, self.video_size, 0, prog
+            else:
+                img_frames = max(1, total_scene_frames - vid_frames)
+                img_local = max(0, local_frame - vid_frames)
+                prog = min(1.0, max(0.0, float(img_local) / float(max(1, img_frames - 1))))
+                return self.image_tex, self.image_size, base_effect, prog
+
+        if mode in ("video", "video_freeze") and self.video_reader is not None:
+            while self.frames_decoded <= local_frame:
+                frame_data = self.video_reader.read_next_frame()
+                self.video_tex.write(frame_data, alignment=1)
+                self.frames_decoded += 1
+            prog = min(1.0, max(0.0, float(local_frame) / float(max(1, total_scene_frames - 1))))
+            return self.video_tex, self.video_size, base_effect, prog
+
+        if self.image_tex is not None:
+            prog = min(1.0, max(0.0, float(local_frame) / float(max(1, total_scene_frames - 1))))
+            return self.image_tex, self.image_size, base_effect, prog
+
+        return self.black_tex, (4, 4), 0, 0.0
+
+    def release(self):
+        if self.video_reader is not None:
+            self.video_reader.close()
+            self.video_reader = None
+        for tex_attr in ("video_tex", "image_tex", "black_tex"):
+            tex = getattr(self, tex_attr, None)
+            if tex is not None:
+                try:
+                    tex.release()
+                except Exception:
+                    pass
+                setattr(self, tex_attr, None)
+
+
+def _monta_filtro_atempo(vel: float) -> str:
+    """Gera cadeia válida de filtros atempo (FFmpeg aceita 0.5..2.0 por estágio)."""
+    if abs(vel - 1.0) < 0.002:
+        return ""
+    partes = []
+    v = max(0.25, min(4.0, float(vel)))
+    while v < 0.5:
+        partes.append("atempo=0.5")
+        v /= 0.5
+    while v > 2.0:
+        partes.append("atempo=2.0")
+        v /= 2.0
+    partes.append(f"atempo={v:.5f}")
+    return ",".join(partes)
+
+
+def _constroi_audio_ambiente_opengl(planos_cenas: list, duracao_total: float, tmp_dir: str) -> Optional[str]:
+    """
+    Extrai e posiciona no tempo exato o áudio dos clipes de vídeo com volume > 0,
+    respeitando slow-motion (atempo) e duração da parte de vídeo.
+    Retorna caminho do WAV sincronizado ou None se nenhum clipe possuir áudio ativo.
+    """
+    faixas = []
+    for idx, p in enumerate(planos_cenas):
+        v_src = p.get("video_src")
+        vol = float(p.get("volume", 0.0))
+        if not v_src or vol <= 0.001:
+            continue
+        if not video_tem_audio(v_src):
+            continue
+
+        slow = float(p.get("slow_factor", 1.0))
+        if p["mode"] in ("video_plus_image", "video_freeze"):
+            dur_clip_audio = min(float(p["dur_real"]), float(p["dur_vid"]))
+        else:
+            dur_clip_audio = float(p["dur_real"])
+
+        if dur_clip_audio <= 0.05:
+            continue
+
+        seg_wav = os.path.join(tmp_dir, f"amb_seg_{idx:04d}.wav")
+        af_parts = []
+        if slow > 1.001:
+            atempo_str = _monta_filtro_atempo(1.0 / slow)
+            if atempo_str:
+                af_parts.append(atempo_str)
+        af_parts.append(f"atrim=0:{dur_clip_audio:.4f}")
+        af_parts.append("asetpts=PTS-STARTPTS")
+        af_parts.append(f"volume={vol:.3f}")
+        af_parts.append("aresample=48000")
+
+        cmd_seg = [
+            "ffmpeg", "-y", "-v", "error",
+            "-i", v_src,
+            "-vn",
+            "-af", ",".join(af_parts),
+            "-ac", "2", "-ar", "48000",
+            seg_wav,
+        ]
+        roda_ffmpeg(cmd_seg, f"extração de áudio ambiente da cena {idx + 1}")
+        faixas.append({
+            "path": seg_wav,
+            "delay_ms": max(0, int(round(float(p["start_t"]) * 1000.0))),
+        })
+
+    if not faixas:
+        return None
+
+    # Mistura em lotes de até 24 entradas para suportar projetos longos sem estourar o filter_complex
+    base_wav = os.path.join(tmp_dir, "ambient_base.wav")
+    roda_ffmpeg(
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+            "-t", f"{max(0.1, duracao_total):.4f}",
+            "-ac", "2", "-ar", "48000",
+            base_wav,
+        ],
+        "base silenciosa de áudio ambiente",
+    )
+
+    atual = base_wav
+    batch_size = 24
+    for b_idx in range(0, len(faixas), batch_size):
+        lote = faixas[b_idx:b_idx + batch_size]
+        prox = os.path.join(tmp_dir, f"ambient_mix_{b_idx // batch_size}.wav")
+        cmd = ["ffmpeg", "-y", "-v", "error", "-i", atual]
+        filter_parts = []
+        mix_inputs = ["[0:a]"]
+        for k, item in enumerate(lote, start=1):
+            cmd.extend(["-i", item["path"]])
+            d_ms = item["delay_ms"]
+            filter_parts.append(f"[{k}:a]adelay={d_ms}|{d_ms},apad[a{k}]")
+            mix_inputs.append(f"[a{k}]")
+
+        n_in = len(mix_inputs)
+        # normalize=0 preserva exatamente o volume configurado de cada clipe sem atenuar pelo número de entradas
+        filter_parts.append(
+            f"{''.join(mix_inputs)}amix=inputs={n_in}:duration=first:dropout_transition=0:normalize=0[aout]"
+        )
+        cmd.extend([
+            "-filter_complex", ";".join(filter_parts),
+            "-map", "[aout]",
+            "-t", f"{max(0.1, duracao_total):.4f}",
+            "-ac", "2", "-ar", "48000",
+            prox,
+        ])
+        roda_ffmpeg(cmd, f"mixagem de áudio ambiente (lote {b_idx // batch_size + 1})")
+        atual = prox
+
+    return atual
+
+
+def _valida_mp4_final_ffprobe(saida_mp4: str, duracao_audio: float, fps: int) -> list:
+    """Executa auditoria ffprobe de duração e FPS médio no MP4 final."""
+    avisos = []
+    try:
+        cmd_probe = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=duration,nb_frames,avg_frame_rate",
+            "-of", "json",
+            saida_mp4,
+        ]
+        out_probe = subprocess.check_output(cmd_probe, text=True).strip()
+        data_probe = json.loads(out_probe)
+        streams = data_probe.get("streams", [])
+        if streams:
+            st = streams[0]
+            dur_str = st.get("duration")
+            frames_str = st.get("nb_frames")
+            avg_fps_str = st.get("avg_frame_rate", "")
+
+            dur_video = 0.0
+            if dur_str and dur_str != "N/A":
+                try:
+                    dur_video = float(dur_str)
+                except Exception:
+                    pass
+
+            if dur_video <= 0.05:
+                cmd_fmt = [
+                    "ffprobe", "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    saida_mp4,
+                ]
+                out_fmt = subprocess.check_output(cmd_fmt, text=True).strip()
+                if out_fmt and out_fmt != "N/A":
+                    try:
+                        dur_video = float(out_fmt)
+                    except Exception:
+                        pass
+
+            fps_nominal = 0.0
+            if avg_fps_str and avg_fps_str != "0/0":
+                if "/" in avg_fps_str:
+                    num, den = avg_fps_str.split("/", 1)
+                    if float(den) > 0:
+                        fps_nominal = float(num) / float(den)
+                else:
+                    fps_nominal = float(avg_fps_str)
+
+            nb_frames_val = 0
+            if frames_str and frames_str != "N/A" and str(frames_str).isdigit():
+                nb_frames_val = int(frames_str)
+            elif fps_nominal > 0 and dur_video > 0:
+                nb_frames_val = int(round(fps_nominal * dur_video))
+
+            fps_medio = (nb_frames_val / dur_video) if (dur_video > 0 and nb_frames_val > 0) else fps_nominal
+            print(f"📊 Vídeo final (GPU Studio): {dur_video:.2f} s, {nb_frames_val} quadros, fps médio {fps_medio:.2f}")
+
+            if duracao_audio and (duracao_audio - dur_video > 2.0):
+                diff_s = round(duracao_audio - dur_video, 1)
+                avisos.append(f"O vídeo final tem {diff_s} s a menos que a narração.")
+
+            if fps and fps_medio < (0.90 * fps):
+                fps_fmt = round(fps_medio, 1)
+                avisos.append(f"O vídeo tem taxa de quadros variável (média de {fps_fmt} fps, esperado {fps}).")
+    except Exception as e:
+        print(f"⚠️ Aviso ao validar MP4 final (GPU Studio): {e}")
+    return avisos
+
+
+def renderiza_video_opengl(instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4, cb_status=None, resolucao=RESOLUCAO, preset="fast", crf=None, formato="", qualidade="", fps=FPS):
+    """
+    Motor GPU Studio: renderiza todas as cenas em streaming na GPU via ModernGL (OpenGL 3.3 Core)
+    com suporte completo a:
+      - 33 transições GLSL reais na fronteira entre cenas (sem reduzir duração total)
+      - 10 filtros de cor/textura com intensidade configurável
+      - 6 movimentos de câmera suaves em sub-pixel (float32)
+      - Enquadramentos contain, cover e blur (fundo desfocado em GPU)
+      - Mídia mista (imagens + clipes MP4 com corte, slow-motion até 1.40x, imagem complementar ou freeze)
+      - Áudio ambiente sincronizado dos clipes MP4 + narração + BGM opcional
+      - Codificação direta via pipe para FFmpeg h264_nvenc (ou libx264 se NVENC indisponível na GPU)
+    """
+    is_progresso = isinstance(cb_status, ProgressoJob)
+
+    # 1. Validação estrita de GPU + OpenGL/EGL (interrompe com aviso claro se faltar GPU)
+    diag = _verifica_gpu_opengl_obrigatorio()
+    usa_nvenc = bool(diag.get("nvenc_disponivel", False))
+    encoder_label = "h264_nvenc" if usa_nvenc else "libx264"
+
+    dst_w, dst_h = int(resolucao[0]), int(resolucao[1])
+    fps = int(fps)
+    perfil_label = f"{formato} {qualidade}".strip() if (formato or qualidade) else f"{dst_w}x{dst_h}"
+    print(
+        f"✨ Iniciando GPU Studio (OpenGL + GLSL + {encoder_label}) | "
+        f"GPU: {diag['gpu_nome']} | Perfil: {perfil_label} ({dst_w}x{dst_h}) @ {fps}fps | {len(instrucoes)} cenas"
+    )
+
+    if is_progresso:
+        cb_status.atualiza_detalhe(f"GPU pronta: {diag['gpu_nome']} ({encoder_label})")
+
+    unidades_visuais = obtem_unidades_visuais(pasta_job)
+    tmp_dir = tempfile.mkdtemp(prefix="motor_opengl_")
+    ctx = None
+    fbo_a = fbo_b = fbo_out = None
+    tex_a = tex_b = tex_out = None
+    vbo = vao_scene = vao_trans = None
+    prog_scene = prog_trans = None
+    enc_proc = None
+    enc_log_fh = None
+    sources_abertas = {}
+
+    try:
+        # 2. Planejamento de todas as cenas (paridade total com as regras de vídeo/imagem do motor 4.2)
+        planos = []
+        total_cenas = len(instrucoes)
+        t_acumulado = 0.0
+
+        for i, cena in enumerate(instrucoes):
+            dur_real = instrucoes[i + 1]["start"] - cena["start"] if i < total_cenas - 1 else duracao_audio - cena["start"]
+            dur_real = max(float(dur_real), 0.1)
+            id_cena = cena["id_cena"]
+            arquivo = cena.get("arquivo", None)
+
+            id_str = str(id_cena).strip().lower()
+            id_clean = id_str.lstrip("0") or "0"
+            base_decl = nome_base_sem_ext(arquivo).lower() if arquivo else id_str
+            base_decl_clean = base_decl.lstrip("0") or "0"
+            id_digits = re.sub(r"\D", "", id_str).lstrip("0") or "0"
+
+            unidade_escolhida = None
+            for u in unidades_visuais:
+                b = u["base"]
+                b_clean = b.lstrip("0") or "0"
+                b_digits = re.sub(r"\D", "", b).lstrip("0") or "0"
+                if (arquivo and (arquivo.lower() == (u["video"] or "").lower() or arquivo.lower() == (u["imagem"] or "").lower())) \
+                   or b == base_decl or b_clean == base_decl_clean or (b_digits and b_digits == id_digits):
+                    unidade_escolhida = u
+                    break
+
+            if not unidade_escolhida:
+                for u in unidades_visuais:
+                    b = u["base"]
+                    b_clean = b.lstrip("0") or "0"
+                    b_digits = re.sub(r"\D", "", b).lstrip("0") or "0"
+                    if b == id_str or b_clean == id_clean or (b_digits and b_digits == id_digits) or id_str in b or b in id_str:
+                        unidade_escolhida = u
+                        break
+
+            if not unidade_escolhida and i < len(unidades_visuais):
+                unidade_escolhida = unidades_visuais[i]
+
+            video_src = unidade_escolhida["video_path"] if unidade_escolhida else None
+            image_src = unidade_escolhida["image_path"] if unidade_escolhida else None
+
+            if not video_src and not image_src and arquivo:
+                caminho_dir = os.path.join(pasta_job, arquivo)
+                if os.path.exists(caminho_dir):
+                    if eh_video(arquivo):
+                        video_src = caminho_dir
+                    elif eh_imagem(arquivo):
+                        image_src = caminho_dir
+
+            dur_vid = obtem_duracao_midia(video_src) if video_src else 0.0
+            slow_factor = 1.0
+            if video_src and dur_vid > 0.05:
+                if dur_real <= dur_vid:
+                    mode = "video"
+                elif dur_real <= (dur_vid * 1.40):
+                    mode = "video"
+                    slow_factor = dur_real / dur_vid
+                elif image_src:
+                    mode = "video_plus_image"
+                else:
+                    mode = "video_freeze"
+            elif image_src:
+                mode = "image"
+            else:
+                mode = "black"
+
+            start_t = t_acumulado
+            end_t = t_acumulado + dur_real
+            t_acumulado = end_t
+
+            planos.append({
+                "index": i,
+                "id_cena": id_cena,
+                "mode": mode,
+                "video_src": video_src,
+                "image_src": image_src,
+                "dur_vid": dur_vid,
+                "dur_real": dur_real,
+                "slow_factor": slow_factor,
+                "start_t": start_t,
+                "end_t": end_t,
+                "fit": (cena.get("fit") or "contain").lower(),
+                "effect": (cena.get("effect") or "none").lower(),
+                "filter": (cena.get("filter") or "none").lower(),
+                "filter_intensity": max(0.0, min(1.0, float(cena.get("filter_intensity", 100)) / 100.0)),
+                "transition": (cena.get("transition") or "none").lower(),
+                "transition_duration": max(0.0, float(cena.get("transition_duration", 0.8))),
+                "volume": float(cena.get("volume", 0.0)),
+            })
+
+        if not planos:
+            raise ValueError("Nenhuma cena válida encontrada na timeline para renderização OpenGL.")
+
+        # Converte timestamps acumulados para intervalos inteiros contíguos sem drift
+        duracao_total_render = t_acumulado
+        prev_end_frame = 0
+        for idx, p in enumerate(planos):
+            sf = prev_end_frame
+            ef = int(round(p["end_t"] * fps))
+            if ef <= sf:
+                ef = sf + 1
+            p["start_frame"] = sf
+            p["end_frame"] = ef
+            p["num_frames"] = ef - sf
+            prev_end_frame = ef
+
+        total_frames = prev_end_frame
+
+        # Calcula janelas de transição (sem reduzir duração total: sobreposição suave na abertura da cena B)
+        for idx, p in enumerate(planos):
+            if idx == 0:
+                p["trans_frames"] = 0
+                continue
+            t_name = p["transition"]
+            t_dur = p["transition_duration"]
+            if t_name != "none" and t_dur > 0.01:
+                prev_len = planos[idx - 1]["num_frames"]
+                curr_len = p["num_frames"]
+                tf = int(round(t_dur * fps))
+                tf = min(tf, max(1, prev_len // 2), max(1, curr_len // 2))
+                p["trans_frames"] = max(0, tf)
+            else:
+                p["trans_frames"] = 0
+
+        # 3. Áudio ambiente sincronizado dos clipes MP4 (quando houver clipes com volume > 0)
+        if is_progresso:
+            cb_status.inicia_etapa("audio_ambiente", detalhe="Verificando áudio dos clipes de vídeo...")
+        ambient_wav = _constroi_audio_ambiente_opengl(planos, duracao_total_render, tmp_dir)
+
+        # 4. Inicialização do contexto ModernGL (OpenGL 3.3 Core headless) + Shaders + FBOs
+        if is_progresso:
+            cb_status.inicia_etapa("render_gpu", detalhe=f"Compilando shaders GLSL na GPU ({diag['gpu_nome']})...")
+        elif cb_status:
+            cb_status("render", "Inicializando shaders OpenGL na GPU...", 15)
+
+        ctx = _cria_contexto_opengl_headless()
+        prog_scene = ctx.program(vertex_shader=_QUAD_VERTEX_SHADER, fragment_shader=_SCENE_FRAGMENT_SHADER)
+        prog_trans = ctx.program(vertex_shader=_QUAD_VERTEX_SHADER, fragment_shader=_TRANSITION_FRAGMENT_SHADER)
+
+        # Quad cobrindo [-1, 1] com UV (0,0) em (-1,-1) e (1,1) em (1,1):
+        # mantém layout top-to-bottom idêntico ao PIL e ao FFmpeg rawvideo RGB24 sem flip em CPU!
+        quad_data = np.array([
+            -1.0, -1.0, 0.0, 0.0,
+             1.0, -1.0, 1.0, 0.0,
+            -1.0,  1.0, 0.0, 1.0,
+             1.0,  1.0, 1.0, 1.0,
+        ], dtype="f4")
+        vbo = ctx.buffer(quad_data.tobytes())
+        vao_scene = ctx.simple_vertex_array(prog_scene, vbo, "in_pos", "in_uv")
+        vao_trans = ctx.simple_vertex_array(prog_trans, vbo, "in_pos", "in_uv")
+
+        tex_a = ctx.texture((dst_w, dst_h), 3)
+        tex_b = ctx.texture((dst_w, dst_h), 3)
+        tex_out = ctx.texture((dst_w, dst_h), 3)
+        for tx in (tex_a, tex_b, tex_out):
+            tx.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            tx.repeat_x = False
+            tx.repeat_y = False
+
+        fbo_a = ctx.framebuffer(color_attachments=[tex_a])
+        fbo_b = ctx.framebuffer(color_attachments=[tex_b])
+        fbo_out = ctx.framebuffer(color_attachments=[tex_out])
+
+        # 5. Abre pipe único para o codificador FFmpeg (NVENC por hardware se disponível)
+        video_sem_audio = os.path.join(tmp_dir, "video_opengl_raw.mp4")
+        enc_log_path = os.path.join(tmp_dir, "ffmpeg_encoder.log")
+        enc_log_fh = open(enc_log_path, "wb")
+
+        cmd_enc = [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-pix_fmt", "rgb24",
+            "-s", f"{dst_w}x{dst_h}",
+            "-r", str(fps),
+            "-i", "pipe:0",
+            "-an",
+        ]
+        if usa_nvenc:
+            cq_val = "26" if (crf and str(crf) == "28") else "19"
+            cmd_enc.extend([
+                "-c:v", "h264_nvenc",
+                "-preset", "p4",
+                "-rc", "vbr",
+                "-cq", cq_val,
+                "-b:v", "0",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                video_sem_audio,
+            ])
+        else:
+            cmd_enc.extend([
+                "-c:v", "libx264",
+                "-preset", preset,
+                "-crf", str(crf or "20"),
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                video_sem_audio,
+            ])
+
+        enc_proc = subprocess.Popen(
+            cmd_enc,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=enc_log_fh,
+            bufsize=dst_w * dst_h * 3 * 2,
+        )
+
+        def _obtem_source(idx_cena: int) -> _SceneTextureSource:
+            if idx_cena not in sources_abertas:
+                sources_abertas[idx_cena] = _SceneTextureSource(ctx, planos[idx_cena], fps, (dst_w, dst_h))
+            return sources_abertas[idx_cena]
+
+        def _renderiza_cena_para_fbo(target_fbo, idx_cena: int, local_frame: int, t_global: float):
+            p_cena = planos[idx_cena]
+            src = _obtem_source(idx_cena)
+            tex, src_sz, eff_mode, prog_val = src.get_frame_state(local_frame)
+            target_fbo.use()
+            ctx.viewport = (0, 0, dst_w, dst_h)
+            ctx.clear(0.0, 0.0, 0.0, 1.0)
+            tex.use(location=0)
+            _set_uniform(prog_scene, "u_tex", 0)
+            _set_uniform(prog_scene, "u_src_size", (float(src_sz[0]), float(src_sz[1])))
+            _set_uniform(prog_scene, "u_dst_size", (float(dst_w), float(dst_h)))
+            _set_uniform(prog_scene, "u_fit_mode", OPENGL_FIT_MAP.get(p_cena["fit"], 0))
+            _set_uniform(prog_scene, "u_effect_mode", eff_mode)
+            _set_uniform(prog_scene, "u_progress", float(prog_val))
+            _set_uniform(prog_scene, "u_filter_mode", OPENGL_FILTER_MAP.get(p_cena["filter"], 0))
+            _set_uniform(prog_scene, "u_filter_intensity", float(p_cena["filter_intensity"]))
+            _set_uniform(prog_scene, "u_time", float(t_global))
+            vao_scene.render(moderngl.TRIANGLE_STRIP)
+
+        # 6. Loop principal de streaming frame-a-frame (mantém no máximo 2 cenas em VRAM)
+        t_inicio_render = time.time()
+        ultimo_report = 0.0
+        curr_idx = 0
+
+        for f_idx in range(total_frames):
+            while curr_idx < total_cenas - 1 and f_idx >= planos[curr_idx]["end_frame"]:
+                curr_idx += 1
+
+            p_curr = planos[curr_idx]
+            local_curr = f_idx - p_curr["start_frame"]
+            t_global = float(f_idx) / float(fps)
+            tf = p_curr["trans_frames"]
+            em_transicao = (curr_idx > 0 and tf > 0 and local_curr < tf)
+
+            # Libera imediatamente qualquer cena que não seja necessária neste frame (VRAM constante)
+            manter = {curr_idx}
+            if em_transicao:
+                manter.add(curr_idx - 1)
+            for aberto_idx in list(sources_abertas.keys()):
+                if aberto_idx not in manter:
+                    sources_abertas.pop(aberto_idx).release()
+
+            if em_transicao:
+                prev_idx = curr_idx - 1
+                p_prev = planos[prev_idx]
+                local_prev = f_idx - p_prev["start_frame"]
+                _renderiza_cena_para_fbo(fbo_a, prev_idx, local_prev, t_global)
+                _renderiza_cena_para_fbo(fbo_b, curr_idx, local_curr, t_global)
+
+                fbo_out.use()
+                ctx.viewport = (0, 0, dst_w, dst_h)
+                tex_a.use(location=0)
+                tex_b.use(location=1)
+                _set_uniform(prog_trans, "u_from", 0)
+                _set_uniform(prog_trans, "u_to", 1)
+                _set_uniform(prog_trans, "u_progress", float(local_curr + 0.5) / float(tf))
+                _set_uniform(prog_trans, "u_trans_mode", OPENGL_TRANSITION_MAP.get(p_curr["transition"], 4))
+                _set_uniform(prog_trans, "u_resolution", (float(dst_w), float(dst_h)))
+                vao_trans.render(moderngl.TRIANGLE_STRIP)
+                frame_raw = fbo_out.read(components=3, alignment=1)
+            else:
+                _renderiza_cena_para_fbo(fbo_out, curr_idx, local_curr, t_global)
+                frame_raw = fbo_out.read(components=3, alignment=1)
+
+            try:
+                enc_proc.stdin.write(frame_raw)
+            except BrokenPipeError:
+                break
+
+            agora = time.time()
+            if (agora - ultimo_report >= 0.8) or (f_idx == total_frames - 1):
+                ultimo_report = agora
+                frac = float(f_idx + 1) / float(total_frames)
+                eta_s = None
+                if f_idx >= fps and f_idx < total_frames - 1:
+                    decorrido = agora - t_inicio_render
+                    fps_real = float(f_idx + 1) / max(decorrido, 0.001)
+                    restantes = total_frames - (f_idx + 1)
+                    eta_s = int(round(restantes / max(fps_real, 0.1)))
+                detalhe_txt = f"Cena {curr_idx + 1}/{total_cenas} · Frame {f_idx + 1}/{total_frames} ({encoder_label})"
+                if is_progresso:
+                    cb_status.fracao(frac, detalhe_txt, eta_s=eta_s)
+                elif cb_status:
+                    cb_status("render", detalhe_txt, int(15 + frac * 70))
+
+        # Fecha pipe de vídeo e valida término do encoder
+        if enc_proc.stdin:
+            try:
+                enc_proc.stdin.close()
+            except Exception:
+                pass
+        ret_enc = enc_proc.wait()
+        enc_proc = None
+        if enc_log_fh:
+            enc_log_fh.close()
+            enc_log_fh = None
+
+        if ret_enc != 0 or not os.path.exists(video_sem_audio) or os.path.getsize(video_sem_audio) == 0:
+            err_tail = ""
+            try:
+                with open(enc_log_path, "r", encoding="utf-8", errors="replace") as f_log:
+                    err_tail = f_log.read().strip()[-800:]
+            except Exception:
+                pass
+            raise RuntimeError(f"Encoder FFmpeg ({encoder_label}) falhou no motor GPU Studio: {err_tail}")
+
+        # Libera VRAM antes da mixagem final
+        for s in list(sources_abertas.values()):
+            s.release()
+        sources_abertas.clear()
+
+        # 7. Mixagem final de áudio (Narração + Áudio Ambiente dos Clipes MP4 + BGM opcional)
+        if is_progresso:
+            cb_status.inicia_etapa("mixagem", detalhe="Mixando narração, áudio ambiente e gerando MP4 final...")
+        elif cb_status:
+            cb_status("render", "Mixando áudio e gerando MP4 final...", 90)
+
+        bgm_path = None
+        for f in os.listdir(pasta_job):
+            if nome_base_sem_ext(f) == "bgm" and eh_audio(f):
+                bgm_path = os.path.join(pasta_job, f)
+                break
+
+        tem_bgm = bool(bgm_path and os.path.exists(bgm_path))
+        tem_amb = bool(ambient_wav and os.path.exists(ambient_wav))
+
+        if tem_amb and tem_bgm:
+            cmd_mix = [
+                "ffmpeg", "-y",
+                "-i", video_sem_audio,
+                "-i", audio_path,
+                "-i", ambient_wav,
+                "-i", bgm_path,
+                "-filter_complex", "[1:a]volume=1.0[voz];[2:a]volume=1.0[amb];[3:a]volume=0.2[bgm];[voz][amb][bgm]amix=inputs=3:duration=first:dropout_transition=2[aout]",
+                "-c:v", "copy", "-c:a", "aac", "-ar", "48000", "-b:a", "192k",
+                "-shortest", "-movflags", "+faststart",
+                "-map", "0:v:0", "-map", "[aout]", saida_mp4,
+            ]
+            roda_ffmpeg(cmd_mix, "mixagem final GPU Studio (voz + ambiente + BGM)")
+        elif tem_amb:
+            cmd_mix = [
+                "ffmpeg", "-y",
+                "-i", video_sem_audio,
+                "-i", audio_path,
+                "-i", ambient_wav,
+                "-filter_complex", "[1:a]volume=1.0[voz];[2:a]volume=1.0[amb];[voz][amb]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+                "-c:v", "copy", "-c:a", "aac", "-ar", "48000", "-b:a", "192k",
+                "-shortest", "-movflags", "+faststart",
+                "-map", "0:v:0", "-map", "[aout]", saida_mp4,
+            ]
+            roda_ffmpeg(cmd_mix, "mixagem final GPU Studio (voz + ambiente)")
+        elif tem_bgm:
+            cmd_mix = [
+                "ffmpeg", "-y",
+                "-i", video_sem_audio,
+                "-i", audio_path,
+                "-i", bgm_path,
+                "-filter_complex", "[1:a]volume=1.0[voz];[2:a]volume=0.2[bgm];[voz][bgm]amix=inputs=2:duration=first:dropout_transition=2[aout]",
+                "-c:v", "copy", "-c:a", "aac", "-ar", "48000", "-b:a", "192k",
+                "-shortest", "-movflags", "+faststart",
+                "-map", "0:v:0", "-map", "[aout]", saida_mp4,
+            ]
+            roda_ffmpeg(cmd_mix, "mixagem final GPU Studio (voz + BGM)")
+        else:
+            cmd_mix = [
+                "ffmpeg", "-y",
+                "-i", video_sem_audio,
+                "-i", audio_path,
+                "-c:v", "copy", "-c:a", "aac", "-ar", "48000", "-b:a", "192k",
+                "-shortest", "-movflags", "+faststart",
+                "-map", "0:v:0", "-map", "1:a:0", saida_mp4,
+            ]
+            roda_ffmpeg(cmd_mix, "mixagem final GPU Studio (voz)")
+
+        # 8. Validação ffprobe idêntica ao motor 4.2
+        return _valida_mp4_final_ffprobe(saida_mp4, duracao_audio, fps)
+    finally:
+        for s in list(sources_abertas.values()):
+            try:
+                s.release()
+            except Exception:
+                pass
+        sources_abertas.clear()
+
+        if enc_proc is not None:
+            try:
+                if enc_proc.stdin:
+                    enc_proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                enc_proc.terminate()
+                enc_proc.wait(timeout=3)
+            except Exception:
+                try:
+                    enc_proc.kill()
+                except Exception:
+                    pass
+        if enc_log_fh is not None:
+            try:
+                enc_log_fh.close()
+            except Exception:
+                pass
+
+        for obj in (vao_scene, vao_trans, vbo, prog_scene, prog_trans, fbo_a, fbo_b, fbo_out, tex_a, tex_b, tex_out, ctx):
+            if obj is not None:
+                try:
+                    obj.release()
+                except Exception:
+                    pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# ==============================================================================
 # 5. FASTAPI APP COM CORS & BYPASS DO NGROK
 # ==============================================================================
 app = FastAPI(title="Motor de Dobra 4.2 AI Studio", version="4.2")
@@ -1476,17 +3002,26 @@ class ProgressoJob:
 @app.get("/")
 @app.get("/status")
 def get_engine_status():
-    gpu_nome = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
+    diag = diagnostico_gpu_opengl()
     try:
         total_cache = len([f for f in os.listdir(PASTA_CACHE) if f.endswith('.json')]) if os.path.exists(PASTA_CACHE) else 0
     except Exception:
         total_cache = 0
 
+    motores = ["ffmpeg"]
+    if diag["opengl_disponivel"]:
+        motores.append("opengl")
+
     return {
         "status": "online",
         "motor": "Motor de Dobra 4.2 AI Studio",
         "versao": "4.2-ngrok-direct",
-        "gpu": gpu_nome,
+        "gpu": diag["gpu_nome"],
+        "gpu_ativa": diag["gpu_ativa"],
+        "opengl_disponivel": diag["opengl_disponivel"],
+        "opengl_motivo": diag["opengl_motivo"],
+        "nvenc_disponivel": diag["nvenc_disponivel"],
+        "motores_disponiveis": motores,
         "whisper_model": WHISPER_MODEL,
         "sem_drive": True,
         "timestamp": datetime.now().isoformat(),
@@ -1505,9 +3040,12 @@ def get_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job não encontrado")
     return JOBS_STATUS[job_id]
 
-def processa_job_background(job_id: str, tipo: str, formato: str = "", qualidade: str = "", ignorar_cache: bool = False, fps: Optional[int] = None):
+def processa_job_background(job_id: str, tipo: str, formato: str = "", qualidade: str = "", ignorar_cache: bool = False, fps: Optional[int] = None, motor_render: str = "ffmpeg"):
     pasta_job = os.path.join(PASTA_JOBS, job_id)
     fps_job = fps if (fps and 10 <= fps <= 120) else FPS
+    motor_clean = (motor_render or "ffmpeg").strip().lower()
+    if motor_clean not in ("ffmpeg", "opengl"):
+        motor_clean = "ffmpeg"
 
     # Resolução do perfil de vídeo configurado
     perfil = resolve_perfil(formato, qualidade)
@@ -1529,7 +3067,7 @@ def processa_job_background(job_id: str, tipo: str, formato: str = "", qualidade
                 instrucoes = tl_pronta['cenas']
                 duracao_audio = float(tl_pronta.get('duracao_total', 0.0))
                 usando_timeline_pronta = True
-                print(f"🎬 Usando timeline enviada pelo App: {len(instrucoes)} cenas")
+                print(f"🎬 Usando timeline enviada pelo App: {len(instrucoes)} cenas (motor: {motor_clean})")
         except Exception as e:
             print(f"⚠️ Erro ao ler timeline.json enviada: {e}")
 
@@ -1537,9 +3075,9 @@ def processa_job_background(job_id: str, tipo: str, formato: str = "", qualidade
     if tipo == 'timeline':
         plano_chave = 'timeline'
     elif usando_timeline_pronta:
-        plano_chave = 'render_com_timeline'
+        plano_chave = 'render_opengl_com_timeline' if motor_clean == 'opengl' else 'render_com_timeline'
     else:
-        plano_chave = 'timeline_e_render'
+        plano_chave = 'timeline_e_render_opengl' if motor_clean == 'opengl' else 'timeline_e_render'
 
     progresso = ProgressoJob(job_id, plano_chave)
     progresso.inicia_etapa("preparo", detalhe="Verificando arquivos recebidos...")
@@ -1647,15 +3185,22 @@ def processa_job_background(job_id: str, tipo: str, formato: str = "", qualidade
             with open(saida_json, 'w', encoding='utf-8') as f:
                 json.dump(timeline_data, f, ensure_ascii=False, indent=2)
 
-        # Renderização em MP4 se solicitada
+        # Renderização em MP4 se solicitada (roteamento isolado: ffmpeg 4.2 padrão vs opengl GPU Studio)
         avisos_render = []
         if tipo in ['timeline_e_render', 'render']:
             saida_mp4 = os.path.join(pasta_job, "video_final.mp4")
-            avisos_render = renderiza_video(
-                instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4, progresso,
-                resolucao=resolucao_job, preset=preset_job, crf=crf_job,
-                formato=formato, qualidade=qualidade, fps=fps_job
-            ) or []
+            if motor_clean == "opengl":
+                avisos_render = renderiza_video_opengl(
+                    instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4, progresso,
+                    resolucao=resolucao_job, preset=preset_job, crf=crf_job,
+                    formato=formato, qualidade=qualidade, fps=fps_job
+                ) or []
+            else:
+                avisos_render = renderiza_video(
+                    instrucoes, pasta_job, audio_path, duracao_audio, saida_mp4, progresso,
+                    resolucao=resolucao_job, preset=preset_job, crf=crf_job,
+                    formato=formato, qualidade=qualidade, fps=fps_job
+                ) or []
 
         # Mensagem de conclusão: incorpora avisos da validação caso existam
         if avisos_render:
@@ -1674,6 +3219,7 @@ async def enviar_job(
     formato: str = Form(""),
     qualidade: str = Form(""),
     fps: str = Form(""),
+    motor_render: str = Form("ffmpeg"),
     ignorar_cache: str = Form(""),
     arquivos: List[UploadFile] = File(...)
 ):
@@ -1683,6 +3229,7 @@ async def enviar_job(
     """
     f_clean = (formato or "").strip()
     q_clean = (qualidade or "").strip().lower()
+    motor_clean = (motor_render or "ffmpeg").strip().lower()
     ignorar_cache_bool = str(ignorar_cache).strip().lower() in ["1", "true", "on"]
 
     # Mapeamento de aliases
@@ -1697,9 +3244,16 @@ async def enviar_job(
         if 10 <= val <= 120:
             fps_int = val
 
-    # Validação de formato e qualidade contra whitelist
+    # Validação de formato, qualidade e motor de renderização contra whitelist
     formatos_validos = ["16:9", "9:16", "1:1"]
     qualidades_validas = ["480p", "720p", "1080p", "1440p", "2160p", "2k", "4k"]
+    motores_validos = ["ffmpeg", "opengl"]
+
+    if motor_clean not in motores_validos:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Motor de renderização inválido: '{motor_clean}'. Motores suportados: ffmpeg, opengl."
+        )
 
     if f_clean and f_clean not in formatos_validos:
         raise HTTPException(
@@ -1724,13 +3278,15 @@ async def enviar_job(
             shutil.copyfileobj(arq.file, buffer)
 
     fps_tag = f" {fps_int}fps" if fps_int else ""
-    info_perfil = f" [{f_clean} {q_clean}{fps_tag}]" if (f_clean and q_clean) else ""
+    motor_tag = " · GPU Studio OpenGL" if motor_clean == "opengl" else ""
+    info_perfil = f" [{f_clean} {q_clean}{fps_tag}{motor_tag}]" if (f_clean and q_clean) else (f" [{motor_tag.strip(' ·')}]" if motor_tag else "")
     set_job_status(job_id, "recebido", f"{len(arquivos)} arquivos recebidos no Colab{info_perfil}", 10)
-    background_tasks.add_task(processa_job_background, job_id, tipo, f_clean, q_clean, ignorar_cache_bool, fps_int)
+    background_tasks.add_task(processa_job_background, job_id, tipo, f_clean, q_clean, ignorar_cache_bool, fps_int, motor_clean)
 
     return {
         "status": "sucesso",
         "job_id": job_id,
+        "motor_render": motor_clean,
         "mensagem": "Arquivos recebidos com sucesso na GPU do Colab! Processamento iniciado.",
         "total_arquivos": len(arquivos)
     }
@@ -1800,8 +3356,14 @@ def inicia_servidor():
     if public_url.startswith("http://"):
         public_url = public_url.replace("http://", "https://")
 
-    # Informações de GPU
-    gpu_info = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "⚠️ CPU (Sem GPU ativa)"
+    # Informações de GPU + Diagnóstico GPU Studio (OpenGL + NVENC)
+    diag_gpu = diagnostico_gpu_opengl(force_refresh=True)
+    gpu_info = diag_gpu["gpu_nome"] if diag_gpu["gpu_ativa"] else "⚠️ CPU (Sem GPU ativa)"
+    if diag_gpu["opengl_disponivel"]:
+        enc_badge = "NVENC" if diag_gpu["nvenc_disponivel"] else "libx264"
+        opengl_badge_html = f'<b style="color:#3fb950; display:block; margin-top:2px;">OpenGL Ativo ({enc_badge})</b>'
+    else:
+        opengl_badge_html = '<b style="color:#f85149; display:block; margin-top:2px;">Indisponível (Ative GPU T4/L4)</b>'
 
     # CARD VISUAL INTERATIVO COM BOTÃO COPIAR -> COPIADO E SUPORTE A SEM CONFIRMAÇÃO
     card_html = f'''
@@ -1823,7 +3385,7 @@ def inicia_servidor():
                     ⚡ MOTOR DE DOBRA 4.2 AI STUDIO
                 </h2>
                 <div style="font-size:12px; color:#8b949e; margin-top:3px;">
-                    Modo Direto • Sem dependência do Google Drive • GPU Pronta
+                    Modo Direto • FFmpeg 4.2 + GPU Studio (OpenGL/GLSL) • Sem Google Drive
                 </div>
             </div>
             <span style="
@@ -1844,10 +3406,14 @@ def inicia_servidor():
         </div>
 
         <!-- DETALHES DE GPU E MOTOR -->
-        <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:18px; font-size:12px;">
+        <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:10px; margin-bottom:18px; font-size:12px;">
             <div style="background:#21262d; padding:10px 14px; border-radius:8px; border:1px solid #30363d;">
                 <span style="color:#8b949e;">Acelerador:</span>
                 <b style="color:#f0883e; display:block; margin-top:2px;">{gpu_info}</b>
+            </div>
+            <div style="background:#21262d; padding:10px 14px; border-radius:8px; border:1px solid #30363d;">
+                <span style="color:#8b949e;">GPU Studio:</span>
+                {opengl_badge_html}
             </div>
             <div style="background:#21262d; padding:10px 14px; border-radius:8px; border:1px solid #30363d;">
                 <span style="color:#8b949e;">Modelo Whisper:</span>
